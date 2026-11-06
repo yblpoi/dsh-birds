@@ -8,7 +8,7 @@
 | 录音 | BirdNET+ V3.0 preview3.1 Global 11K（ONNX, FP16） | 11,000+ | 每个物种的最高分与时间段 |
 | 录音（可选） | BirdNET+ Geomodel V3.0.4 Global 14K（ONNX, FP16） | 14,082 | 按经纬度 + 周次筛掉不可能出现的物种 |
 
-命令执行完直接返回文本，**不进入 LLM 回合、不产生 token 费用**。这是 DSH 命令注册表（`ctx.commands.register`）的官方能力，不是对 dsh-im 的 hack。
+命令执行完直接返回文本，**不进入 LLM 回合、不产生 token 费用**。这首先是 DSH 命令注册表（`ctx.commands.register`）的官方能力；对「客户端把带附件的行当普通消息发」的情况，插件再用回合边界钩子 `agent/pre-step` 兜底（见 §4）。
 
 ---
 
@@ -32,7 +32,7 @@ dsh-birds/
 ├── package.json                 插件清单（main 指向 lib/index.js，dsh.bundle.patch 指向 cordis.patch.yml）
 ├── cordis.patch.yml             加载补丁：- insert: - id: dsh-birds
 ├── lib/
-│   ├── index.js                 插件入口：注册 /birdid 与 /birdstatus，可选的 Telegram 桥
+│   ├── index.js                 插件入口：注册 /birds 与 /birdstatus，可选的 Telegram 桥；另有 agent/pre-step 兜底（带附件的 /birds 不发给模型）
 │   ├── engine.mjs               三个模型的懒加载容器
 │   ├── ort.mjs                  onnxruntime-node 封装 + IEEE-754 float16 互转
 │   ├── paths.mjs                模型目录与文件名清单
@@ -51,7 +51,7 @@ dsh-birds/
 ├── docs/implementation.md       实施方案与模型核对笔记
 └── test/
     ├── selftest.mjs             WAV/重采样/分块/排版 单元自测
-    ├── host-mock.mjs            用 mock ctx 驱动插件，验证注册与 handler 契约
+    ├── host-mock.mjs            用 mock ctx 驱动插件，验证注册、handler 契约与 pre-step 接管
     └── imports.mjs              动态导入每个模块，防止坏导出或坏导入路径
 ```
 
@@ -96,11 +96,11 @@ ln -sfn ~/src/dsh-birds ~/.dsh/profiles/desktop/node_modules/dsh-birds
         #   lon: 116.4074
 ```
 
-重启 Host（桌面端的「重启」或 `dsh` 重启）。命令面板里应能看到 `/birdid` 与 `/birdstatus`。
+重启 Host（桌面端的「重启」或 `dsh` 重启）。命令面板里应能看到 `/birds` 与 `/birdstatus`。
 
 更新插件时，方式 A 重跑一次安装命令；方式 B 在 clone 目录 `git pull && npm install --omit=dev`，重启 Host 即可。
 
-> 注意：命令名必须匹配 `^[a-z][a-z0-9_-]*$`（DSH 命令注册表的硬性校验），所以是 `/birdid` 而不是 `/鸟`。
+> 注意：命令名必须匹配 `^[a-z][a-z0-9_-]*$`（DSH 命令注册表的硬性校验），所以是 `/birds` 而不是 `/鸟`。
 
 ### 3.2 依赖说明
 
@@ -161,9 +161,9 @@ node scripts/download-models.mjs --check
 在 DSH 的任意会话里：
 
 ```
-/birdid              ← 和一张鸟照片一起发送
-/birdid              ← 和一段录音一起发送
-/birdid /sdcard/DCIM/bird.jpg
+/birds              ← 和一张鸟照片一起发送
+/birds              ← 和一段录音一起发送
+/birds /sdcard/DCIM/bird.jpg
 /birdstatus
 ```
 
@@ -180,9 +180,21 @@ node scripts/download-models.mjs --check
 
 命令的 `input` 声明了 `attachments: true`，所以 DSH 会把附件经 `@deepseek-ai/dsh-attachment` 存储后传给你；插件用 `ctx.get('attachments').imageHostPath(ref)` / `fileHostPath(ref)` 拿到 Host 侧绝对路径再喂给模型。
 
+### 为什么带附件时也不会烧 token
+
+命令注册表只负责**客户端主动路由过来的行**。有的客户端（例如 DSH Go 的 composer）遇到「带附件的消息」会整行当普通 prompt 发给模型，根本不查命令表，于是 `/birds` + 一张照片就白烧一个回合。
+
+插件因此在回合边界上加了一道兜底钩子 `agent/pre-step`：命中 `/birds` 时自己算完，写回与命令注册表完全相同的一对 `command/run` + `command/done` 事件，然后返回 `{ kind: 'enter', messages: [] }` —— 内核看到「进入一个空 step」就直接把这一回合标成 completed，**不 append `user/message`、不建请求、不花 token**，UI 里照常出现一条命令结果。
+
+几个刻意的边界：
+
+- 只在 `step === 1` 且这一批**恰好只有这一条消息**时接管。同批还有别的 prompt（排队消息）、或行是在回合中途进来的，一律放行给正常链路，避免吞掉用户的其他输入。
+- 只认 `/birds`，`/birdstatus` 之类仍走注册表。
+- 不伪造 `assistant/message`：那种事件下次加载会话时会被校验出 `source.kind !== 'model'` 而整段失败。
+
 ### 可选：Telegram 桥
 
-如果你希望**照片在进入 Harness 之前就被本地消化掉**（连 `/birdid` 都不用打），在 config 里加：
+如果你希望**照片在进入 Harness 之前就被本地消化掉**（连 `/birds` 都不用打），在 config 里加：
 
 ```yaml
 - insert:
@@ -256,7 +268,7 @@ apt update && apt install -y ffmpeg
 cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 
 # 4) 下模型（约 250 MB，可断点续传）
-cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-models.mjs
+cd ~/.dsh/profiles/web/node_modules/dsh-birds && node scripts/download-models.mjs
 
 # 5) 重启 DSH，然后 /birdstatus 检查
 ```
@@ -271,7 +283,7 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-model
 | 声学模型常驻内存 | 约 30–50 MB；每个 3 秒窗口约 0.4 s |
 | Geomodel | 约 8 MB，一次前向约 0.07 s |
 | 三个模型全部 createSession | 约 0.8 s |
-| `/birdid` 音频端到端（3 s WAV） | 约 0.6 s（含 WAV 解析、分块、声学推理、地理先验、排版） |
+| `/birds` 音频端到端（3 s WAV） | 约 0.6 s（含 WAV 解析、分块、声学推理、地理先验、排版） |
 | 并发线程 | 默认 `intraOpNumThreads: 2`，避免 PRoot 里把 CPU 打死；可调 |
 
 两个模型都是**首次用到才加载**（`lib/engine.mjs`），插件卸载时 `release()` 释放。手机上如果内存吃紧，把 `maxAudioSeconds` 调小（默认 600 秒）。
@@ -282,7 +294,7 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-model
 2. **`sharp` 装不上**：它只是可选依赖，插件会自动回退到 `ffmpeg` 解码图片。两条路都不通时才会报错，报错文案里写清了怎么修。
 3. **下载中断**：脚本保留 `.part`，重跑即续传。
 4. **`ffmpeg` 缺失 + 非 WAV 音频**：报错会直接告诉你去 `apt install -y ffmpeg`。
-5. **模型下完但 `/birdid` 仍说没模型**：模型目录是按运行插件的那个用户的 `$HOME` 解析的。用 root 手动跑过下载脚本，模型就落在 `/root/.dsh/models/bird`；如果 DSH 以别的用户运行，需要 `chown` 或显式传 `DSH_BIRDS_MODELS`/`--dir`。
+5. **模型下完但 `/birds` 仍说没模型**：模型目录是按运行插件的那个用户的 `$HOME` 解析的。用 root 手动跑过下载脚本，模型就落在 `/root/.dsh/models/bird`；如果 DSH 以别的用户运行，需要 `chown` 或显式传 `DSH_BIRDS_MODELS`/`--dir`。
 6. **在 proot 里手动跑命令**：从 Android 侧直接执行 `libproot.so` 会因为找不到 `libtalloc.so` 和临时目录而失败，必须先导出 `LD_LIBRARY_PATH`、`PROOT_LOADER`、`PROOT_L2S_DIR`、`PROOT_TMP_DIR`（这些值可以在 `/proc/<proot pid>/environ` 里看到）。用 Magisk 的 `su` 可以这样进：`su -c '<rootfs 里的 bash> -lc "cd /root && node ..."'`。
 
 ---
@@ -291,13 +303,13 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-model
 
 ```bash
 node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版 / 地理先验门控
-node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、生命周期
+node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 33 项 + `hosttest` 26 项 + `imports` 14 项，共 73 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 33 项 + `hosttest` 42 项 + `imports` 14 项，共 89 项断言全部 PASS。
 
-`hosttest` 尤其重要：它证明 handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常，只会返回一句人话。
+`hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 
 ---
 

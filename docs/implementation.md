@@ -7,22 +7,23 @@
 
 ## 1. 结论先行
 
-做了三件事：
+做了四件事：
 
-1. **定位了唯一可行的扩展点**：DSH 内核自带人类命令注册表 `ctx.commands.register`（`@deepseek-ai/dsh-commands`），命令 handler 直接返回文本，**整个执行过程不启动 agent 回合**。这就是「不花 token」的官方口径。
-2. **否掉了改 dsh-im 的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）。
-3. **写出了完整插件** `dsh-birds`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
+1. **定位了第一层扩展点**：DSH 内核自带人类命令注册表 `ctx.commands.register`（`@deepseek-ai/dsh-commands`），命令 handler 直接返回文本，**整个执行过程不启动 agent 回合**。
+2. **发现注册表有覆盖不到的入口**：注册表只管**客户端主动路由过来的行**。DSH Go 的 composer 在带附件时整行当普通 prompt 投给 `session/prompt`（`chat_screen.dart:486-493`），服务端 prompt 不做命令路由，于是 `/birds` + 照片仍会进 LLM。补一层回合边界钩子 `agent/pre-step` 兜底（见 §2.1）。
+3. **否掉了改 dsh-im 的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）。
+4. **写出了完整插件** `dsh-birds`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
 
 ---
 
 ## 2. 数据流
 
 ```
-用户: /birdid  + 一张照片
+用户: /birds  + 一张照片
         │
         ▼
 DSH 内核 commands 服务
-  ├─ parseCommand("/birdid")            ← @deepseek-ai/dsh-commands/lib/index.js
+  ├─ parseCommand("/birds")             ← @deepseek-ai/dsh-commands/lib/index.js
   ├─ 按 input.attachments: true 收附件
   │    └─ admitCommandAttachments → AttachmentStore 落盘（content-addressed）
   ├─ 记录 command/run 事件
@@ -43,6 +44,40 @@ DSH 内核 settle → 记录 command/done → 把 text 显示给用户
 
 录音同一条链路，只是中段换成：`readAudio` → 重采样 32 kHz → 3 秒分块 → `AcousticClassifier.analyze` → 可选 Geomodel 过滤。
 
+### 2.1 兜底：`agent/pre-step` 接管（客户端的坑）
+
+DSH Go（Flutter 客户端）的 `chat_screen.dart:486-493` 里写着：
+
+```dart
+// With attachments or a quote the line is a message, even if it starts with "/"
+if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) ... }
+```
+
+即**只要带了附件（或引用、或生成模式），整行就按普通消息发送**，不再走 `_runSlash`。而服务端 `session/prompt`（`dsh-api-session-controller/lib/index.js:831-874`）**不做任何命令路由**，`/birds` 在那里只是普通文本。结果是客户端的这个判断直接决定了「带图发送 = 烧一个模型回合」。
+
+插件侧无法改客户端，所以在**回合边界**兜底。核对过宿主源码后的关键事实：
+
+| 事实 | 出处 |
+| --- | --- |
+| `agent/pre-step` 是 waterfall，不调 `next()` 即否决整条链（含内建行为） | `cordis/lib/index.js:896-921`（注释 846-852） |
+| 返回 `{kind:'enter', messages: []}` 时，代码走 `if (phase.step === 0 && decision.messages.length === 0) { turnEnds = {kind:'completed'}; return false; }` | `dsh-agent-loop/lib/index.js:753-757` |
+| `user/message` 是在 `step()` 里才 append 的，位于 pre-step **之后** | `dsh-agent-loop/lib/index.js:861-868` |
+| `command/run`、`command/done` 在 `KNOWN_SESSION_EVENT_TYPES` 内、**不在** `SURFACE_EVENT_TYPES` 内，可两参 `session.append` | `dsh-session/lib/index.js` |
+| 客户端 `CommandLog` 只认 `data['commandId']` 的 `command/run` + `command/done` 对 | `chat_state.dart:1969-2040` |
+| turn 以 `completed` 结束时，optimistic 气泡静默消失；只有 `error/aborted/interrupted` 才显示失败卡片 | `chat_state.dart:936-955` |
+
+实现（`lib/index.js` 的 `interceptBirds`）：
+
+1. `step !== 1`、signal 已中止、或这一批不是**恰好一条**消息 → `next()`，交回正常链路。
+2. 取消息首个 text part，用与内核相同的行语法 `^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])` 解析；命令名不是 `birds` → 放行。
+3. 自己 mint `cmd-<8位随机>-<自增>`，`session.append('command/run', {commandId, name, args?, source:{kind:'user'}})`。
+4. 复用命令 handler 的识别逻辑算出文本，再 `append('command/done', {commandId, kind, text})`。
+5. `return { kind: 'enter', messages: [] }`。
+
+**为什么只认单条批次**：`inbox.claim()` 在 pre-step 之前就把这批消息从待发队列里取走了，且不可撤销。若同批还有用户排队的别的 prompt，一起吞掉就是丢输入。所以宁可在多消息批次上放行（退回旧行为），也不冒吞消息的风险。
+
+**为什么不用 `llm/stream` 伪造窗口**：那条路也能短路（`api-catalog.js:5019-5024`），但 yield 出来的 chunk 会被写进 `assistant/message`，属于伪造模型输出；而 `assistant/message` 的重放校验要求 `source.kind === 'model'` 与 provider/model，下次加载 session 会直接失败。`command/run` + `command/done` 才是客户端本来就渲染、且没有任何伪造嫌疑的通道。
+
 ---
 
 ## 3. 为什么不能改 dsh-im（证据）
@@ -55,7 +90,7 @@ DSH 内核 settle → 记录 command/done → 把 text 显示给用户
 | 带图片的消息进不了命令分支 | `src/channels/shared/text-harness-bridge.mjs:466` 的 `commandRunner` 选择逻辑；`#process`（1086 行）只本地处理 `/help`、`/status`、workspace 系列、`/new`、`/compact` |
 | 同一 token 不能两处轮询 | Telegram `getUpdates` 单消费者语义 |
 
-所以：**新写一个独立 cordis host 插件**，用 DSH 的命令注册表落地；需要「连 /birdid 都不打」时，插件可选起一条自己的 Telegram 长轮询桥（用独立 bot token），媒体在进入 Harness 之前就被消化掉。
+所以：**新写一个独立 cordis host 插件**，用 DSH 的命令注册表落地；需要「连 /birds 都不打」时，插件可选起一条自己的 Telegram 长轮询桥（用独立 bot token），媒体在进入 Harness 之前就被消化掉。
 
 ---
 
@@ -122,8 +157,9 @@ npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-bird
 # ④ 下模型（约 250 MB，断点续传）
 cd node_modules/dsh-birds && node scripts/download-models.mjs
 
-# ⑤ 重启 DSH，在会话里敲
-/birdstatus
+# ⑤ 重启 DSH，在会话里敲（两个命令都应出现在命令面板里）
+/birdstatus          # 六个模型文件与推理引擎状态
+/birds               # 附带图片或录音，本机识别
 ```
 
 ### onnxruntime-node 为什么能在 Android 跑
@@ -149,12 +185,14 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 
 | 检查 | 命令 | 期望 |
 | --- | --- | --- |
-| 命令注册 | 会话里输入 `/` | 出现 `birdid`、`birdstatus` |
+| 命令注册 | 会话里输入 `/` | 出现 `birds`、`birdstatus` |
 | 模型状态 | `/birdstatus` | 六个文件都是 ✓，推理引擎可用 |
-| 图片识别 | `/birdid` + 鸟照 | 返回 top-5，含「0 token」字样 |
-| 录音识别 | `/birdid` + 3 秒以上鸟鸣 | 返回物种 + 时间段 + 命中段数 |
+| 图片识别 | `/birds` + 鸟照 | 返回 top-5，含「0 token」字样 |
+| 录音识别 | `/birds` + 3 秒以上鸟鸣 | 返回物种 + 时间段 + 命中段数 |
+| 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 全部断言 PASS |
+| 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 33 + 42 + 14 = 89 条断言全 PASS |
 
 ---
 
