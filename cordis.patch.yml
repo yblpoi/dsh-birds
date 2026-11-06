@@ -1,0 +1,30 @@
+# dsh-bird 加载补丁。顶层是 DSH loader 的 patch 数组，insert 把插件挂进 Host。
+- insert:
+    - id: dsh-bird
+      name: dsh-bird
+      config:
+        # 模型目录；~ 会展开到 $HOME
+        modelsDir: ~/.dsh/models/bird
+        # 输出前 N 个候选
+        topK: 5
+        # 声学判定阈值（BirdNET+ analyze.py 默认 0.15，web-demo 默认 0.25）
+        minConfidence: 0.15
+        # 分析窗口长度与重叠（秒）
+        chunkSeconds: 3
+        overlapSeconds: 0
+        # 单个录音最多分析多少秒，超出的部分丢弃
+        maxAudioSeconds: 600
+        # 可选：地理先验（Geomodel）。不填就只用声学结果。
+        # geo:
+        #   lat: 39.9042
+        #   lon: 116.4074
+        #   # week 省略时按当天 ISO 周（自动夹到 1..48）
+        #   # week: 24
+        # geoThreshold: 0.03
+        # 可选：Telegram 桥。用独立的 bot token，别和 dsh-im 复用同一个。
+        # telegram:
+        #   token: "123456:ABC-DEF..."
+        #   allowedUserIds: [123456789]
+        #   triggerWords: ["鸟", "bird", "识别", "认鸟"]
+        #   recognizeEveryMedia: false
+        #   maxFileBytes: 20971520

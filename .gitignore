@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 模型文件（体积大，用 npm run download-models 拉取，不入库）
+*.onnx
+*.onnx.part
+*.safetensors
+*.tflite
+*.pt
+*.part
+
+# 运行时产物
+models/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地私有配置
+.env
+.env.*
+config.local.*
