@@ -119,5 +119,37 @@ const statusText = formatStatus({
 });
 check('status marks present/missing', statusText.includes('✓ imageModel') && statusText.includes('✗ audioModel'), statusText);
 
+// ---- GeoPrior: symbolic batch dim in the geomodel graph ----
+// This was a real regression: geo.predict() passed [null, 3] to runSession, and
+// onnxruntime-node rejects a non-integer dim with "dims[0] must be an integer,
+// got: null". recognize.mjs wraps the geo step in try/catch, so the failure was
+// silent and every acoustic result lost its geographic filter. The assertions
+// below pin the shape contract without needing the 7.5 MB model on disk.
+const geoSource = fs.readFileSync(new URL('../lib/geo.mjs', import.meta.url), 'utf8');
+check('geo predicts with a concrete [1, 3] input shape', geoSource.includes('input, [1, 3]'), geoSource.match(/runSession\([^)]*\]/)?.[0]);
+check('geo never passes a null dim to the tensor constructor', !/\[null,\s*3\]/.test(geoSource));
+
+const { DEFAULT_GEO_THRESHOLD, filterByAllowedSpecies, normaliseSpeciesName } = await import('../lib/geo.mjs');
+check('geo default threshold is 0.03', DEFAULT_GEO_THRESHOLD === 0.03, String(DEFAULT_GEO_THRESHOLD));
+check('geo normalises a scientific name', normaliseSpeciesName('  Parus  Major ') === 'parus major', normaliseSpeciesName('  Parus  Major '));
+check('geo folds underscores into spaces', normaliseSpeciesName('Parus_major') === 'parus major', normaliseSpeciesName('Parus_major'));
+
+const filtered = filterByAllowedSpecies(
+  [
+    { scientific: 'Parus_major', score: 0.8 },
+    { scientific: 'Pica_pica', score: 0.7 },
+    { scientific: '', score: 0.6 },
+  ],
+  new Set(['parus major']),
+);
+check('geo keeps allowed species', filtered.kept.some((d) => d.scientific === 'Parus_major'), JSON.stringify(filtered.kept));
+check('geo drops ruled-out species', !filtered.kept.some((d) => d.scientific === 'Pica_pica'), JSON.stringify(filtered.kept));
+check('geo keeps detections without a scientific name', filtered.kept.some((d) => d.scientific === ''), JSON.stringify(filtered.kept));
+check('geo reports how many it dropped', filtered.dropped === 1, String(filtered.dropped));
+check('geo marks the filter as applied', filtered.applied === true, String(filtered.applied));
+
+const unapplied = filterByAllowedSpecies([{ scientific: 'Pica_pica', score: 0.7 }], null);
+check('geo passes detections through when there is no gate', unapplied.applied === false && unapplied.kept.length === 1, JSON.stringify(unapplied));
+
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);

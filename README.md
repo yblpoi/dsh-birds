@@ -136,12 +136,23 @@ node scripts/download-models.mjs
 | --- | --- | --- |
 | `BirdTrace-FastViT-MA36-10K.onnx` | 222,385,590 B | `https://hf-mirror.com/warden123/BirdTrace-FastViT-MA36-10K/resolve/main/model.onnx` |
 | `BirdTrace-FastViT-MA36-10K.classes.json` | 1,000,770 B | 同上 `classes.json` |
-| `BirdNET+_V3.0-preview3.1_Global_11K_FP16_pruned.onnx` | — | `https://zenodo.org/records/20703646/files/…?download=1` |
-| `BirdNET+_V3.0-preview3.1_Global_11K_Labels.csv` | — | 同上 |
+| `BirdNET+_V3.0-preview3.1_Global_11K_FP16_pruned.onnx` | 71,528,628 B | `https://zenodo.org/records/20703646/files/…?download=1` |
+| `BirdNET+_V3.0-preview3.1_Global_11K_Labels.csv` | 809,172 B | 同上 |
 | `BirdNET+_Geomodel_V3.0.4_Global_14K_FP16.onnx` | 7,885,053 B | `https://github.com/birdnet-team/geomodel/releases/download/v3.0.4/…` |
 | `BirdNET+_Geomodel_V3.0.4_Global_14K_Labels.txt` | 671,823 B | 同上 |
 
 > **为什么要用 hf-mirror**：`huggingface.co`、`cdn.jsdelivr.net`、`raw.githubusercontent.com` 在部分网络环境下直连超时，而 `hf-mirror.com`、`zenodo.org`、`github.com` 通常可用。Zenodo 与 GitHub Releases 都支持 Range 请求，所以脚本能断点续传，手机上一次下不完可以再跑一次。
+
+**下载失败时先跑自检**，它只发 `Range: bytes=0-0` 探测每条线路，不写任何文件：
+
+```bash
+node scripts/download-models.mjs --check
+# 每个文件逐条打印 ✓/✗、HTTP 状态、最终落到哪个 CDN、文件大小与耗时
+```
+
+常用参数：`--only=<文件名片段>` 只下一个文件、`--hf=<镜像地址>` 换镜像、`--dir=<目录>` 换存放位置、`--retry=<次数>`、`--force` 重下、`--ua=<User-Agent>` 覆盖 UA。下载中断后重跑会从 `.part` 续传，只有大小与 SHA-256 都校验通过才会重命名成正式文件。
+
+> **Zenodo 的 403 坑**：Zenodo 会对**不带 User-Agent 头**的请求直接返回 403。Node 的全局 `fetch` 默认不发 UA，所以早期版本在手机上必失败（报 `HTTP 403 Forbidden`）。脚本现在给每个请求都带上 `User-Agent`，正常情况下不会再触发；如果你自己写脚本拉 Zenodo，记得手动加 UA。
 
 ---
 
@@ -241,7 +252,8 @@ node -v             # 期望 v22.19 以上
 apt update && apt install -y ffmpeg
 
 # 3) 装插件（从 GitHub 仓库装，不需要 npm 账号）
-cd ~/.dsh/profiles/desktop && npm install github:yblpoi/dsh-birds
+#    DSH Go 的 profile 目录名是 web（桌面端通常是 desktop），先 ls ~/.dsh/profiles 确认
+cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 
 # 4) 下模型（约 250 MB，可断点续传）
 cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-models.mjs
@@ -251,11 +263,15 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-model
 
 ### 真机上的性能与内存
 
+实测机型：OPPO PKX110，Android 16，aarch64（DSH Go 内置 PRoot Ubuntu，Node v24.22.1）。
+
 | 项目 | 数值/说明 |
 | --- | --- |
-| 图片模型常驻内存 | 约 212 MB 权重 + 中间激活；一次 384×384 前向在 8 核手机上约 1–3 s |
-| 声学模型常驻内存 | 约 30–50 MB；每个 3 秒窗口约 0.2–0.5 s |
-| Geomodel | 约 8 MB，一次前向毫秒级 |
+| 图片模型常驻内存 | 约 212 MB 权重 + 中间激活；一次 384×384 前向在这台机器上约 1.0 s |
+| 声学模型常驻内存 | 约 30–50 MB；每个 3 秒窗口约 0.4 s |
+| Geomodel | 约 8 MB，一次前向约 0.07 s |
+| 三个模型全部 createSession | 约 0.8 s |
+| `/birdid` 音频端到端（3 s WAV） | 约 0.6 s（含 WAV 解析、分块、声学推理、地理先验、排版） |
 | 并发线程 | 默认 `intraOpNumThreads: 2`，避免 PRoot 里把 CPU 打死；可调 |
 
 两个模型都是**首次用到才加载**（`lib/engine.mjs`），插件卸载时 `release()` 释放。手机上如果内存吃紧，把 `maxAudioSeconds` 调小（默认 600 秒）。
@@ -266,18 +282,20 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-model
 2. **`sharp` 装不上**：它只是可选依赖，插件会自动回退到 `ffmpeg` 解码图片。两条路都不通时才会报错，报错文案里写清了怎么修。
 3. **下载中断**：脚本保留 `.part`，重跑即续传。
 4. **`ffmpeg` 缺失 + 非 WAV 音频**：报错会直接告诉你去 `apt install -y ffmpeg`。
+5. **模型下完但 `/birdid` 仍说没模型**：模型目录是按运行插件的那个用户的 `$HOME` 解析的。用 root 手动跑过下载脚本，模型就落在 `/root/.dsh/models/bird`；如果 DSH 以别的用户运行，需要 `chown` 或显式传 `DSH_BIRDS_MODELS`/`--dir`。
+6. **在 proot 里手动跑命令**：从 Android 侧直接执行 `libproot.so` 会因为找不到 `libtalloc.so` 和临时目录而失败，必须先导出 `LD_LIBRARY_PATH`、`PROOT_LOADER`、`PROOT_L2S_DIR`、`PROOT_TMP_DIR`（这些值可以在 `/proc/<proot pid>/environ` 里看到）。用 Magisk 的 `su` 可以这样进：`su -c '<rootfs 里的 bash> -lc "cd /root && node ..."'`。
 
 ---
 
 ## 7. 自测
 
 ```bash
-node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版 / 地理先验门控
 node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 22 项 + `hosttest` 26 项 + `imports` 14 项，共 62 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 33 项 + `hosttest` 26 项 + `imports` 14 项，共 73 项断言全部 PASS。
 
 `hosttest` 尤其重要：它证明 handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常，只会返回一句人话。
 

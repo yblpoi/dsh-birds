@@ -96,6 +96,8 @@ DSH 内核 settle → 记录 command/done → 把 text 显示给用户
 
 `lib/geo.mjs` 按官方口径实现：`allowedSpecies(lat, lon, week, {threshold})` 返回允许集合，`filterByAllowedSpecies` 按学名归一化后过滤；模型缺失时静默降级。
 
+> **踩过的坑：tensor dims 不能写 `null`**。图里 batch 是 symbolic 的，所以最初按图声明传了 `[null, 3]`，结果 onnxruntime-node 直接抛 `TypeError: dims[0] must be an integer, got: null`。因为 `recognize.mjs` 用 try/catch 包住地理先验（失败只 warn），这个错误会**静默吞掉整个地理过滤**。现在固定传 `[1, 3]`，并在 `test/selftest.mjs` 里加了断言钉死形状。
+
 ---
 
 ## 5. Android / DSH Go 部署步骤
@@ -109,7 +111,7 @@ node -v                        # 应为 v22.19+
 apt update && apt install -y ffmpeg
 
 # ③ 装插件（从 GitHub 仓库装，不需要 npm 账号）
-cd ~/.dsh/profiles/desktop
+cd ~/.dsh/profiles/web                   # DSH Go 的 profile 叫 web；桌面端通常是 desktop
 npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-birds
 # 在 cordis.patch.yml 顶层追加：
 #   - insert:
@@ -127,6 +129,19 @@ cd node_modules/dsh-birds && node scripts/download-models.mjs
 ### onnxruntime-node 为什么能在 Android 跑
 
 包里就带着 `bin/napi-v6/linux/arm64/onnxruntime_binding.node`（551 KB）与 `libonnxruntime.so.1`（25 MB）；`os` 字段只是包管理器的安装守卫；`lib/binding.js` 用 `process.platform`/`process.arch` 拼路径，PRoot 里是 `linux`/`arm64`，天然命中。**不需要重编译，也不需要 wasm 兜底**（wasm 只是文档里留的后路）。
+
+### 从 Android 侧进 PRoot（调试用）
+
+DSH Go 的 Linux 环境是 app 内置的 `libproot.so` 拉起来的，Android 侧没有可以直接 `sh` 进去的入口。手动进入需要复刻它的环境变量（这些值在 `/proc/<proot pid>/environ` 里能直接读到）：
+
+| 变量 | 作用 | 缺失时的报错 |
+| --- | --- | --- |
+| `LD_LIBRARY_PATH` | 指向 app 的 `lib/arm64` | `CANNOT LINK EXECUTABLE: library "libtalloc.so" not found` |
+| `PROOT_LOADER` | `libproot-loader.so` 的绝对路径 | loader 拉起失败 |
+| `PROOT_L2S_DIR` | `<rootfs>/root/.l2s` | link2symlink 失效 |
+| `PROOT_TMP_DIR` | app cache 下的临时目录 | `proot error: can't create glue rootfs` |
+
+Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都会被拒。写进 rootfs 的文件要 `chown` 成 app 的 uid，否则插件读不到。
 
 ---
 
