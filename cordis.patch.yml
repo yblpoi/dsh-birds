@@ -1,7 +1,7 @@
-# dsh-bird 加载补丁。顶层是 DSH loader 的 patch 数组，insert 把插件挂进 Host。
+# dsh-birds 加载补丁。顶层是 DSH loader 的 patch 数组，insert 把插件挂进 Host。
 - insert:
-    - id: dsh-bird
-      name: dsh-bird
+    - id: dsh-birds
+      name: dsh-birds
       config:
         # 模型目录；~ 会展开到 $HOME
         modelsDir: ~/.dsh/models/bird

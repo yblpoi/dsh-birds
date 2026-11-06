@@ -1,4 +1,4 @@
-# dsh-bird — DeepSeek Harness 本地鸟类识别插件
+# dsh-birds — DeepSeek Harness 本地鸟类识别插件
 
 在 **不调用任何大模型** 的前提下，用本机 CPU 跑两个识别模型：
 
@@ -28,9 +28,9 @@
 ## 2. 目录结构
 
 ```
-dsh-bird/
+dsh-birds/
 ├── package.json                 插件清单（main 指向 lib/index.js，dsh.bundle.patch 指向 cordis.patch.yml）
-├── cordis.patch.yml             加载补丁：- insert: - id: dsh-bird
+├── cordis.patch.yml             加载补丁：- insert: - id: dsh-birds
 ├── lib/
 │   ├── index.js                 插件入口：注册 /birdid 与 /birdstatus，可选的 Telegram 桥
 │   ├── engine.mjs               三个模型的懒加载容器
@@ -48,29 +48,45 @@ dsh-bird/
 │   ├── format.mjs               文本排版
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
 ├── scripts/download-models.mjs  模型下载（支持断点续传）
+├── docs/implementation.md       实施方案与模型核对笔记
 └── test/
     ├── selftest.mjs             WAV/重采样/分块/排版 单元自测
-    └── host-mock.mjs            用 mock ctx 驱动插件，验证注册与 handler 契约
+    ├── host-mock.mjs            用 mock ctx 驱动插件，验证注册与 handler 契约
+    └── imports.mjs              动态导入每个模块，防止坏导出或坏导入路径
 ```
 
 ---
 
 ## 3. 安装
 
-### 3.1 放进 DSH profile
+插件**没有发布到 npm registry，也不需要 npm 账号**：GitHub 仓库本身就是安装源。下面命令里的 `npm` 只是包管理器，用来拉取仓库并安装依赖。
+
+### 3.1 装进 DSH profile
+
+方式 A：让包管理器直接从仓库安装（一条命令，依赖会一起装好）：
 
 ```bash
 # 在装有 DSH 的那台机器（桌面端，或 DSH Go 的 PRoot Ubuntu）里
 cd ~/.dsh/profiles/desktop
-npm install dsh-bird          # 或者把本仓库软链/复制进 node_modules
+npm install github:yblpoi/dsh-birds
 ```
+
+方式 B：clone 到任意目录再软链进 profile，方便之后 `git pull` 更新：
+
+```bash
+git clone https://github.com/yblpoi/dsh-birds.git ~/src/dsh-birds
+cd ~/src/dsh-birds && npm install --omit=dev
+ln -sfn ~/src/dsh-birds ~/.dsh/profiles/desktop/node_modules/dsh-birds
+```
+
+也可以直接把仓库 clone 到 `~/.dsh/profiles/desktop/node_modules/dsh-birds`，再进插件目录安装依赖；效果和方式 B 一样，只是没有软链。
 
 然后编辑 `~/.dsh/profiles/desktop/cordis.patch.yml`，在顶层数组追加：
 
 ```yaml
 - insert:
-    - id: dsh-bird
-      name: dsh-bird
+    - id: dsh-birds
+      name: dsh-birds
       config:
         modelsDir: ~/.dsh/models/bird
         topK: 5
@@ -82,34 +98,37 @@ npm install dsh-bird          # 或者把本仓库软链/复制进 node_modules
 
 重启 Host（桌面端的「重启」或 `dsh` 重启）。命令面板里应能看到 `/birdid` 与 `/birdstatus`。
 
+更新插件时，方式 A 重跑一次安装命令；方式 B 在 clone 目录 `git pull && npm install --omit=dev`，重启 Host 即可。
+
 > 注意：命令名必须匹配 `^[a-z][a-z0-9_-]*$`（DSH 命令注册表的硬性校验），所以是 `/birdid` 而不是 `/鸟`。
 
-### 3.2 装依赖
+### 3.2 依赖说明
 
-```bash
-cd ~/.dsh/profiles/desktop/node_modules/dsh-bird
-npm install --omit=dev            # 装 onnxruntime-node；sharp 是 optional
-```
+插件只有一个必装依赖：`onnxruntime-node`，安装插件时会自动装好。`sharp` 是**可选依赖**，装不上不影响使用：图片解码会自动回退到 `ffmpeg`。
 
-**关于 onnxruntime-node 的平台问题（这条值得单独说）**：它的 `package.json` 里 `os` 字段只写了 `["win32","darwin","linux"]`，看起来像「不支持 Android」。但实际上——
+**关于 onnxruntime-node 的平台问题**：它的 `package.json` 里 `os` 字段只写了 `["win32","darwin","linux"]`，看起来像「不支持 Android」。但实际上——
 
 - 主包里就带着 `bin/napi-v6/linux/arm64/onnxruntime_binding.node`（551,752 字节）和 `libonnxruntime.so.1`（25,266,408 字节），**不需要任何额外下载**；
-- `os` 字段只是 npm 的安装守卫，用 `--force` 或手工解包即可绕过；
+- `os` 字段只是包管理器的安装守卫，用 `--force` 或手工解包即可绕过；
 - `lib/binding.js` 用 `require(`../bin/napi-v6/${process.platform}/${process.arch}/onnxruntime_binding.node`)` 拼路径。DSH Go 内置的 PRoot Ubuntu 里 `process.platform === 'linux'`、`process.arch === 'arm64'`，**路径天然命中**。
 
-所以直接 `npm install onnxruntime-node` 就行。若安装时被 `os` 字段挡住：
+所以 Android 上也是直接装依赖即可。若安装时被平台字段挡住，可以：
 
 ```bash
-npm pack onnxruntime-node && tar xzf onnxruntime-node-*.tgz
-mv package node_modules/onnxruntime-node
+npm install --force
 ```
+
+或者把包下载下来手工解包到 `node_modules/onnxruntime-node`。
 
 ### 3.3 下载模型
 
 ```bash
-npm run download-models
+cd ~/.dsh/profiles/desktop/node_modules/dsh-birds
+node scripts/download-models.mjs
 # 或指定目录：node scripts/download-models.mjs --dir=/data/models/bird
 ```
+
+安装时还会提供 `dsh-birds-models` 命令（位于 profile 的 `node_modules/.bin/`），效果相同。
 
 脚本会拉到：
 
@@ -156,8 +175,8 @@ npm run download-models
 
 ```yaml
 - insert:
-    - id: dsh-bird
-      name: dsh-bird
+    - id: dsh-birds
+      name: dsh-birds
       config:
         telegram:
           token: "123456:ABC..."      # 用独立的 bot，别和 dsh-im 复用同一个 token
@@ -221,11 +240,11 @@ node -v             # 期望 v22.19 以上
 # 2) 装 ffmpeg（mp3/m4a/ogg 解码与图片兜底解码都要它）
 apt update && apt install -y ffmpeg
 
-# 3) 装插件
-cd ~/.dsh/profiles/desktop && npm install dsh-bird
+# 3) 装插件（从 GitHub 仓库装，不需要 npm 账号）
+cd ~/.dsh/profiles/desktop && npm install github:yblpoi/dsh-birds
 
 # 4) 下模型（约 250 MB，可断点续传）
-cd ~/.dsh/profiles/desktop/node_modules/dsh-bird && npm run download-models
+cd ~/.dsh/profiles/desktop/node_modules/dsh-birds && node scripts/download-models.mjs
 
 # 5) 重启 DSH，然后 /birdstatus 检查
 ```
@@ -253,11 +272,12 @@ cd ~/.dsh/profiles/desktop/node_modules/dsh-bird && npm run download-models
 ## 7. 自测
 
 ```bash
-npm run selftest          # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版
-npm run hosttest          # 用 mock ctx 验证命令注册、handler 契约、生命周期
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版
+node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、生命周期
+node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 22 项 + `hosttest` 26 项 + `imports` 11 项，共 59 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 22 项 + `hosttest` 26 项 + `imports` 14 项，共 62 项断言全部 PASS。
 
 `hosttest` 尤其重要：它证明 handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常，只会返回一句人话。
 
@@ -265,9 +285,9 @@ npm run hosttest          # 用 mock ctx 验证命令注册、handler 契约、�
 
 ## 8. 许可与合规
 
+- 本插件代码：MIT（见 `LICENSE`）。
 - **BirdTrace FastViT-MA36-10K：CC-BY-NC-4.0，禁止商业使用。**
 - **BirdNET+ V3.0 preview3.1**：Developer Preview，模型与标签会变；使用需遵守其 `TERMS_OF_USE`（Zenodo record 20703646 内附）。
 - **BirdNET+ Geomodel V3.0.4**：另有 `LICENSE-MODELS.md` / `ACCEPTABLE_USE.md`。
-- 本插件代码本身由你自行决定许可。
 
 识别结果是统计模型的输出，**不是鉴定结论**；用于科研、观鸟记录请自行复核，不要用于法律、检疫、保护执法等场景。

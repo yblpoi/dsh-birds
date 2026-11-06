@@ -11,7 +11,7 @@
 
 1. **定位了唯一可行的扩展点**：DSH 内核自带人类命令注册表 `ctx.commands.register`（`@deepseek-ai/dsh-commands`），命令 handler 直接返回文本，**整个执行过程不启动 agent 回合**。这就是「不花 token」的官方口径。
 2. **否掉了改 dsh-im 的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）。
-3. **写出了完整插件** `dsh-bird`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
+3. **写出了完整插件** `dsh-birds`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
 
 ---
 
@@ -27,7 +27,7 @@ DSH 内核 commands 服务
   │    └─ admitCommandAttachments → AttachmentStore 落盘（content-addressed）
   ├─ 记录 command/run 事件
   ▼
-dsh-bird 的 handler(invocation)
+dsh-birds 的 handler(invocation)
   ├─ invocation.attachments[i].attachment  →  ctx.get('attachments').imageHostPath(ref)
   ├─ decodeImageToRgb(file, 384)      ← sharp，缺失时回退 ffmpeg
   ├─ ImageClassifier.classify(rgb)    ← onnxruntime-node 跑 model.onnx
@@ -108,17 +108,17 @@ node -v                        # 应为 v22.19+
 # ② 装运行时依赖
 apt update && apt install -y ffmpeg
 
-# ③ 放插件
+# ③ 装插件（从 GitHub 仓库装，不需要 npm 账号）
 cd ~/.dsh/profiles/desktop
-npm install <本仓库路径或 npm 包名>     # 装进 node_modules/dsh-bird
+npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-birds
 # 在 cordis.patch.yml 顶层追加：
 #   - insert:
-#       - id: dsh-bird
-#         name: dsh-bird
+#       - id: dsh-birds
+#         name: dsh-birds
 #         config: { modelsDir: ~/.dsh/models/bird }
 
 # ④ 下模型（约 250 MB，断点续传）
-cd node_modules/dsh-bird && npm run download-models
+cd node_modules/dsh-birds && node scripts/download-models.mjs
 
 # ⑤ 重启 DSH，在会话里敲
 /birdstatus
@@ -126,7 +126,7 @@ cd node_modules/dsh-bird && npm run download-models
 
 ### onnxruntime-node 为什么能在 Android 跑
 
-包里就带着 `bin/napi-v6/linux/arm64/onnxruntime_binding.node`（551 KB）与 `libonnxruntime.so.1`（25 MB）；`os` 字段只是 npm 安装守卫；`lib/binding.js` 用 `process.platform`/`process.arch` 拼路径，PRoot 里是 `linux`/`arm64`，天然命中。**不需要重编译，也不需要 wasm 兜底**（wasm 只是文档里留的后路）。
+包里就带着 `bin/napi-v6/linux/arm64/onnxruntime_binding.node`（551 KB）与 `libonnxruntime.so.1`（25 MB）；`os` 字段只是包管理器的安装守卫；`lib/binding.js` 用 `process.platform`/`process.arch` 拼路径，PRoot 里是 `linux`/`arm64`，天然命中。**不需要重编译，也不需要 wasm 兜底**（wasm 只是文档里留的后路）。
 
 ---
 
@@ -139,7 +139,7 @@ cd node_modules/dsh-bird && npm run download-models
 | 图片识别 | `/birdid` + 鸟照 | 返回 top-5，含「0 token」字样 |
 | 录音识别 | `/birdid` + 3 秒以上鸟鸣 | 返回物种 + 时间段 + 命中段数 |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
-| 单元自测 | `npm test` | 两套共 40+ 断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 全部断言 PASS |
 
 ---
 

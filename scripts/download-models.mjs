@@ -23,7 +23,8 @@ for (const arg of process.argv.slice(2)) {
 }
 
 const modelsDir = path.resolve(
-  (args.get('dir') ?? process.env.DSH_BIRD_MODELS ?? path.join(os.homedir(), '.dsh', 'models', 'bird'))
+  (args.get('dir') ?? process.env.DSH_BIRDS_MODELS ?? process.env.DSH_BIRD_MODELS
+    ?? path.join(os.homedir(), '.dsh', 'models', 'bird'))
     .replace(/^~/, os.homedir()),
 );
 

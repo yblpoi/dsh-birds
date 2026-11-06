@@ -1,10 +1,26 @@
 {
-  "name": "dsh-bird",
+  "name": "dsh-birds",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "DSH 本地鸟类识别插件：BirdTrace 图片识别 + BirdNET+ 声学识别 + Geomodel 地理先验，全程本机推理，不消耗 LLM token",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yblpoi/dsh-birds.git"
+  },
+  "homepage": "https://github.com/yblpoi/dsh-birds#readme",
+  "bugs": {
+    "url": "https://github.com/yblpoi/dsh-birds/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "bird",
+    "birdnet",
+    "onnxruntime",
+    "species-identification"
+  ],
   "main": "./lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -13,6 +29,7 @@
   "files": [
     "lib",
     "scripts",
+    "docs",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -20,12 +37,13 @@
     "node": ">=22.19"
   },
   "bin": {
-    "dsh-bird-models": "./scripts/download-models.mjs"
+    "dsh-birds-models": "./scripts/download-models.mjs"
   },
   "scripts": {
     "download-models": "node scripts/download-models.mjs",
     "selftest": "node test/selftest.mjs",
     "hosttest": "node test/host-mock.mjs",
+    "importtest": "node test/imports.mjs",
     "test": "node test/selftest.mjs && node test/host-mock.mjs && node test/imports.mjs"
   },
   "dependencies": {

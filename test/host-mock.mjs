@@ -56,9 +56,9 @@ const ctx = {
   },
 };
 
-const modelsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-bird-models-'));
+const modelsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-models-'));
 const mod = await import('../lib/index.js');
-check('module exports a name', mod.name === 'dsh-bird', mod.name);
+check('module exports a name', mod.name === 'dsh-birds', mod.name);
 check('module declares the commands injection', Array.isArray(mod.inject) && mod.inject.includes('commands'), JSON.stringify(mod.inject));
 check('module exports apply()', typeof mod.apply === 'function');
 
