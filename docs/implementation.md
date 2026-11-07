@@ -115,7 +115,7 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 - 改的是**第三方插件的构建产物**：dsh-im 升级或 profile 重装会覆盖，需要重跑脚本；因此它只作为「引用图」的补丁，不承担命令路由。
 - `test/selftest.mjs` 用一份含两处锚点的小样本验证：改写生效、幂等、认不出时抛错；再用 `new Function` 把生成的 `__qbQuotedMedia` 装进桩 `hs`/`kVe` 跑真实入参 —— 引用图变成附件、`load()` 走平台白名单、重复/无 url/非图片/非白名单域名都不搬。
 
-**设置里的入口：`client.js` + `lib/im-patch-api.mjs`（1.0.0 起）**。宿主 0.2.x 的插件管理页**只提供布局**，卡片本身要插件自带浏览器半体：`package.json` 里声明 `dsh.manifestVersion: 1`、`dsh.client: { platform: 'web', inject: [] }` 和 `exports['./client']`（只声明 client 却没有这个 export，`dsh-client-modules` 会直接抛错），`client.js` 用 `window.__ModuleLoader__.load({ id: 'dsh-birds', factory })` 包成单文件，`exports.inject = ['slots']`，在 `apply` 里注册三处槽：
+**设置里的入口：`client.js` + `lib/im-patch-api.mjs`（1.0.0 起）**。变换本体在 `lib/dsh-im-patch.mjs`，`scripts/patch-dsh-im.mjs` 只是它的终端外壳——运行时（宿主半体）不能 import `scripts/`，有的装机方式只搬 `lib/`，那样插件会整块 import 失败（1.0.0 首次真机部署踩到：`ERR_MODULE_NOT_FOUND .../dsh-birds/scripts/patch-dsh-im.mjs`，diagnostics 里多一条 did not activate）。宿主 0.2.x 的插件管理页**只提供布局**，卡片本身要插件自带浏览器半体：`package.json` 里声明 `dsh.manifestVersion: 1`、`dsh.client: { platform: 'web', inject: [] }` 和 `exports['./client']`（只声明 client 却没有这个 export，`dsh-client-modules` 会直接抛错），`client.js` 用 `window.__ModuleLoader__.load({ id: 'dsh-birds', factory })` 包成单文件，`exports.inject = ['slots']`，在 `apply` 里注册三处槽：
 
 | 槽 | key | 说明 |
 | --- | --- | --- |
@@ -251,7 +251,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 139 + 72 + 19 + 67 = 297 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 139 + 72 + 20 + 67 = 298 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `hs`/`kVe` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；引用图变成附件并走平台白名单，重复/无 url/非图片/非白名单域名不搬 |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |

@@ -49,6 +49,7 @@ dsh-birds/
 │   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
 │   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
+│   ├── dsh-im-patch.mjs         dsh-im 引用图补丁的变换本体（设置卡与终端脚本共用）
 │   ├── im-patch-api.mjs         设置卡用的三条本机路由：dsh-im 补丁的状态 / 写入 / 还原
 │   ├── im/quoted.mjs            引用消息回查（按平台文件名找回本机上的引用图）
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
@@ -410,7 +411,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 139 项 + `hosttest` 72 项 + `imports` 19 项 + `settings` 67 项，共 297 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 139 项 + `hosttest` 72 项 + `imports` 20 项 + `settings` 67 项，共 298 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 
