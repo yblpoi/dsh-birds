@@ -75,7 +75,19 @@ async function probe(url, userAgent, timeoutMs = 20_000) {
     await response.body?.cancel?.();
     return { ok: response.ok || response.status === 206, status: response.status, total, elapsedMs: Date.now() - startedAt };
   } catch (error) {
-    return { ok: false, status: 0, total: 0, elapsedMs: Date.now() - startedAt, message: error?.message ?? String(error) };
+    // "fetch failed" alone tells nobody anything: the cause code (ECONNRESET,
+    // ENOTFOUND, a TLS error) is what makes a broken route diagnosable.
+    const detail = error?.name === 'AbortError'
+      ? `超时 ${timeoutMs}ms`
+      : (error?.message ?? String(error));
+    const cause = error?.cause?.code ?? error?.cause?.message;
+    return {
+      ok: false,
+      status: 0,
+      total: 0,
+      elapsedMs: Date.now() - startedAt,
+      message: cause ? `${detail}（${cause}）` : detail,
+    };
   } finally {
     clearTimeout(timer);
   }
