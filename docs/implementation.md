@@ -75,9 +75,9 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 
 1. `step !== 1`、signal 已中止、或这一批不是**恰好一条**消息 → `next()`，交回正常链路。
 2. 扫描消息里**所有** text part（不是只取第一个），用与内核相同的行语法 `^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])` 解析；命令名不是 `birds` → 放行。
-3. 自己 mint `cmd-<8位随机>-<自增>`，`session.append('command/run', {commandId, name, args?, source:{kind:'user'}})`。
-4. 复用命令 handler 的识别逻辑算出文本，再 `append('command/done', {commandId, kind, text})`。
-5. `return { kind: 'reject' }`。
+3. 判来源：消息里有 `<dsh_im_*>` 信封 → 走**聊天桥分支**（见下），否则走客户端分支。
+4. 客户端分支：自己 mint `cmd-<8位随机>-<自增>`，`session.append('command/run', {commandId, name, args?, source:{kind:'user'}})`；复用命令 handler 的识别逻辑算出文本，再 `append('command/done', {commandId, kind, text})`；`return { kind: 'reject' }`。
+5. 聊天桥分支：算出文本后按 `session.id` 暂存 `{text, messageId, at}`，`return next()` 让回合正常开始；随后 `llm/stream` 钩子（`prepend: true`）以 `{type:'text-delta', index:0, text}` + `{type:'finish', reason:{kind:'stop'}}` 接管这次请求，完成后从暂存表删除。
 
 **收口必须用 `reject`（两次实测踩过）**：第一版返回 `{kind:'enter', messages: []}`、默认注册位置，真机上 `command/done` 之后仍紧跟 `step/start` → `request/header`；原因是 `dsh-time-context` 这类监听器跑在外层，`await next()` 拿到空 `enter` 后往里追加了一条 time-context 消息，内核看到 `messages.length === 1` 就走了正常 step。改成 `prepend: true` 后一度在「上下文已送过」的旧会话里成功，但**新会话第一次仍复发**：`dsh-time-context` 自己也用 `{ prepend: true }` 注册且在 profile 插件之后加载，unshift 后仍可能排到我们外面，而新会话第一步必然要追加 time-context / runtime-context 快照。最终改成 `{ kind: 'reject' }`：rejection 不带消息列表，内建包装器（time-context / agent-instructions / action-cards / plan-mode / goal-round-driver / tmux-context / agent / compaction-basic，逐个核对过）要么显式透传 reject、要么只 `return next()`，没人能把回合重新打开。真机复测两次（都带照片）：① 11:05 既有会话的下一回合，`agent/inbox/spliced inserted=1` → `turn/start{turn:2}` → `spliced removed=1` → `command/run` → `command/done{kind:'success'}` → `spliced` → `turn/end{kind:'blocked'}`；② 11:10 全新会话第一步（这一发正是过去会复发的场景），`spliced inserted=1` → `turn/start{turn:1}` → `spliced` → `command/run` → `command/done{kind:'success'}` → `spliced` → `turn/end{kind:'blocked'}`。两次全段都没有 `step/start`、没有 `request/header`、没有 `user/message`；UI 显示识别结果 + 一行「本轮已被拦截」。另外 `test/host-mock.mjs` 里用 `composeWaterfall([timeContextLike, preStep[0]])` 把包装器摆在钩子外层，断言拿到的仍是 `{kind:'reject'}` 且不带 `messages`，把这个不变量钉住。
 
@@ -87,7 +87,15 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 
 **结果不止英文**：名表按标签行号对齐（图片 10480 行、声音 11560 行），每份都记着生成时标签文件的 SHA-256；分类器读完标签先 `bindLabels(kind, labelDigest(text))`，指纹不符就停用名表退回英文名（否则行号一错就会把别种鸟的中文名贴上来）。名表来自 IOC World Bird List 15.1 / 14.2（经 SuperPicky 的 `ioc/birdname.db` 整理），覆盖率图片 9826/10480、声音 9794/11560，未覆盖的是 BirdNET 里昆虫/蛙等非鸟群。排版在 `format.mjs` 的 `speciesLabel()`：有中文就「中文名（English）」，没有就英文名，声音再退学名。
 
-**为什么不用 `llm/stream` 伪造窗口**：那条路也能短路（`api-catalog.js:5019-5024`），但 yield 出来的 chunk 会被写进 `assistant/message`，属于伪造模型输出；而 `assistant/message` 的重放校验要求 `source.kind === 'model'` 与 provider/model，下次加载 session 会直接失败。`command/run` + `command/done` 才是客户端本来就渲染、且没有任何伪造嫌疑的通道。
+**聊天桥为什么必须换一种收口（11:16 真机踩过）**：dsh-im 的 bundle 里 `command/done` 出现 **0 次** —— 它只转发 assistant 文本（`assistant/chunk` 的 `text-delta` 与 `assistant/message` 的 content，`turn/end` 时按 turn 取出推送），并且把 `turn/end` 的 reason 映射成错误码：`turn-blocked → TURN_BLOCKED`、`turn-interrupted/turn-aborted → TURN_INTERRUPTED`，只有 `reason.kind === 'completed'` 的回合才会把 assistant 文本发给 QQ。所以在 QQ 里发「照片 + /birds」时，`reject` 的结果是机器人回一句「本轮处理被阻止，未能完成。错误码：TURN_BLOCKED」，识别结果整个丢失。
+
+修法：桥来的消息不 reject，而是把结果暂存、让回合正常跑，然后用 `llm/stream` 短路模型调用。
+
+**为什么桥用 `llm/stream` 而不算伪造**：短路点在 `dsh-llm/lib/index.js:2398-2402` 的 `ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(options, prepared))`，不调 `next()` 就不会走 adapter、不发网络请求。chunk 是 provider-neutral 协议，内核的 assembler 消费后由 `step()` **自己** `createAssistantMessage(...)` 并 `append('assistant/message', …)`（`dsh-agent-loop/lib/index.js:941-955`），`source: {provider, model}` 也由内核填 —— 插件只提供流，不写事件，重放校验（要求 `source.kind === 'model'` 与 provider/model）天然成立。代价是 ① 日志里必然有 `request/header` / `request/context`（`buildRequest` 里就记账，`:1017-1044`），但没有真实请求、没有用量；② 回合必须以 `completed` 结束，桥才会推送。
+
+**客户端路径则不需要这么做**：DSH 客户端本来就渲染 `command/run` + `command/done`，用 `reject` 更省（不建请求、不产生 request/header、结果卡片下方标「本轮已被拦截」）。两条路径共用同一份识别逻辑，只是投递方式不同。
+
+**correlation 与清理**：暂存键是 `sessionId`，兑现前核对请求里的 user 消息 id 是否就是被接管的那条（不是就不动，留给真正的回合），兑现即删除；120 s 内没等到请求就作废。teardown 时整表清空。`test/host-mock.mjs` 用 `driveModelCall()` 驱动 `llm/stream` 钩子，钉住：桥消息→不写 command 事件、下次请求拿到本地文本、只消费一次、不串会话、不串回合。
 
 ---
 
@@ -205,7 +213,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 120 + 56 + 17 = 193 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 120 + 64 + 17 = 201 条断言全 PASS |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
 | 中英对照名表 | selftest 校验名表行数、抽样中文名、指纹不符时停用 | 图片 9826/10480、声音 9794/11560 |
 

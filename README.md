@@ -233,6 +233,24 @@ node scripts/download-models.mjs --check
 - 不伪造 `assistant/message`：那种事件下次加载会话时会被校验出 `source.kind !== 'model'` 而整段失败。
 - **收口方式同样是契约**：返回 `reject` 而不是空 `enter`，并配 `prepend: true`。宿主的 context 包装器会往 `enter` 的 `messages` 里追加内容，把「空一步」撑成真实一步；`reject` 不带消息列表，它们只会原样透传。
 
+### 聊天桥（QQ / 微信）为什么走另一条收口
+
+dsh-im 这类聊天桥只转发 **assistant 文本**：它不渲染 `command/run` / `command/done`（真机 bundle 里 `command/done` 出现 0 次），并且把 blocked 的回合映射成一句「本轮处理被阻止，未能完成。错误码：TURN_BLOCKED」——所以对桥来的消息用 `reject`，等于把算好的结果扔进垃圾桶，QQ 那头只能看到报错（11:16 真机原样复现）。
+
+于是桥来的 `/birds` 走第二条路：
+
+1. `agent/pre-step` 照常认出这行、算完识别（同样 `prepend` 到最外层），把结果按 `sessionId` 暂存，然后 **`return next()`** 让回合正常开始 —— 不 reject、不写 command 事件（桥也看不见）。
+2. 紧接着注册的 `llm/stream` 钩子（`prepend: true`）接管这一回合的模型调用：命中暂存结果就以流的形式吐出 `{ type: 'text-delta', index: 0, text }` 再吐 `{ type: 'finish', reason: { kind: 'stop' } }`。内核仍照常组装并落盘 `assistant/message`，dsh-im 于是把它当普通回复发到聊天里。
+
+这条路的账要算清：
+
+- **不调用模型、不发网络请求、0 token。** `llm/stream` 是 `ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(...))` 的钩子点，不调 `next()` 就短路掉真实的 adapter 调用。
+- **`assistant/message` 由内核自己写**（`source: { provider, model }` 由内核填），插件只提供 chunk，不伪造事件；会话重新加载时的 seed 校验因此可以正常通过。
+- **代价**：日志里会有 `request/header` / `request/context`（内核在建请求时就会记账），但没有真实请求、没有用量。UI 上也不再是「本轮已被拦截」，而是一条普通的 assistant 回复。
+- **correlation**：暂存键是 `sessionId`，兑现前再核对这次请求的 user 消息 id 是不是被接管的那条，且**一次性消费**；120 秒没等到请求就作废。所以不会误伤同会话里的其他回合，也不会串到别的会话。
+
+两条路径互不影响：DSH 客户端（Flutter / Web）自带附件消息仍走 `reject` + `command` 事件（结果卡片 + 「本轮已被拦截」），聊天桥走 `llm/stream`（普通回复）；两者都是 0 token。
+
 ### 可选：Telegram 桥
 
 如果你希望**照片在进入 Harness 之前就被本地消化掉**（连 `/birds` 都不用打），在 config 里加：
@@ -345,7 +363,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 120 项 + `hosttest` 56 项 + `imports` 17 项，共 193 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 120 项 + `hosttest` 64 项 + `imports` 17 项，共 201 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

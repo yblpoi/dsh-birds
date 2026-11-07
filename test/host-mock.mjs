@@ -151,13 +151,36 @@ check('the takeover hook runs outermost', hookOptions.prepend === true, JSON.str
 /** Drive the listener the way the Host's waterfall does, with a stub session. */
 async function runPreStep(payload) {
   const appended = [];
-  const agent = { session: { append: (type, data) => appended.push({ type, data }) } };
+  const agent = {
+    session: {
+      id: payload.sessionId ?? 'session-1',
+      append: (type, data) => appended.push({ type, data }),
+    },
+  };
   let fellThrough = false;
   const decision = await preStep[0]({ agent, step: 1, turn: 1, signal, ...payload }, async () => {
     fellThrough = true;
     return { kind: 'enter', messages: payload.messages };
   });
   return { appended, decision, fellThrough };
+}
+
+/** Drive the llm/stream waterfall the way the kernel does, collecting chunks. */
+async function driveModelCall(options) {
+  const hooks = listeners.get('llm/stream') ?? [];
+  const chunks = [];
+  let fellThrough = false;
+  // The kernel reads the return value synchronously — `for await (const chunk
+  // of stream)` on the waterfall's return value, no await before it — so a hook
+  // that returns a Promise of an async iterable breaks every model call.
+  const stream = hooks[0](options, () => {
+    fellThrough = true;
+    return (async function* empty() {})();
+  });
+  const iterable = typeof stream?.[Symbol.asyncIterator] === 'function';
+  if (!iterable) return { chunks, fellThrough, iterable };
+  for await (const chunk of stream) chunks.push(chunk);
+  return { chunks, fellThrough, iterable };
 }
 
 const birdsLine = {
@@ -215,34 +238,52 @@ function imMessage(parts) {
   };
 }
 
-const imTaken = await runPreStep({
-  messages: [imMessage([
-    { type: 'text', text: '/birds' },
-    { type: 'text', text: '图片 1（原图文件：1-E0481B.png）' },
-    { type: 'image', attachment: { id: 'a2' } },
-  ])],
-});
-check('an IM-wrapped /birds line with a photo is taken over', imTaken.fellThrough === false);
-check(
-  'the IM takeover rejects the turn instead of entering a step',
-  imTaken.decision.kind === 'reject' && !('messages' in imTaken.decision),
-  JSON.stringify(imTaken.decision).slice(0, 160),
-);
-check(
-  'the IM takeover records the command pair',
-  imTaken.appended[0]?.type === 'command/run' && imTaken.appended[1]?.type === 'command/done',
-  JSON.stringify(imTaken.appended.map((entry) => entry.type)),
-);
-check(
-  'the IM takeover finds the wrapped photo instead of asking for one',
-  typeof imTaken.appended[1]?.data?.text === 'string'
-    && !imTaken.appended[1].data.text.includes('没有收到图片或录音'),
-  imTaken.appended[1]?.data?.text,
-);
+// A bridge is the one path that must NOT reject. dsh-im renders only assistant
+// text and maps a rejected turn to a TURN_BLOCKED error in the chat, so a
+// rejection loses the answer entirely. The takeover therefore lets the turn
+// start and parks the finished text for the request the kernel is about to
+// build; the llm/stream hook answers that request with the text instead of
+// calling a model.
+const imSessionId = 'session-im-1';
+const imLine = imMessage([
+  { type: 'text', text: '/birds' },
+  { type: 'text', text: '图片 1（原图文件：1-E0481B.png）' },
+  { type: 'image', attachment: { id: 'a2' } },
+]);
+const imTaken = await runPreStep({ sessionId: imSessionId, messages: [imLine] });
+check('an IM-wrapped /birds line is claimed at the turn boundary', imTaken.fellThrough === true, JSON.stringify(imTaken.decision).slice(0, 160));
+check('the IM takeover lets the turn start so the chat can receive an answer', imTaken.decision.kind === 'enter', JSON.stringify(imTaken.decision).slice(0, 160));
+check('the IM takeover writes no command events the chat cannot render', imTaken.appended.length === 0, JSON.stringify(imTaken.appended.map((entry) => entry.type)));
+check('the llm/stream hook is registered outermost', (listenerOptions.get('llm/stream')?.[0] ?? {}).prepend === true, JSON.stringify(listenerOptions.get('llm/stream')?.[0]));
 
-const imLine = imMessage([{ type: 'text', text: '/birds /root/test.wav' }, { type: 'image', attachment: { id: 'a3' } }]);
-const imArgsTaken = await runPreStep({ messages: [imLine] });
-check('the IM takeover keeps what follows the command', imArgsTaken.appended[0]?.data?.args === ' /root/test.wav', JSON.stringify(imArgsTaken.appended[0]?.data));
+const imCall = await driveModelCall({ sessionId: imSessionId, messages: [imLine] });
+check('the llm/stream hook returns the stream itself, not a promise of one', imCall.iterable === true);
+check('the IM turn is answered without calling a model', imCall.fellThrough === false);
+check('the IM answer arrives as streamed assistant text', imCall.chunks[0]?.type === 'text-delta' && imCall.chunks[0].index === 0, JSON.stringify(imCall.chunks[0]).slice(0, 160));
+check(
+  'the IM answer is the local result, not a request for a photo',
+  typeof imCall.chunks[0]?.text === 'string'
+    && imCall.chunks[0].text.includes('模型')
+    && !imCall.chunks[0].text.includes('没有收到图片或录音'),
+  imCall.chunks[0]?.text,
+);
+check('the IM answer ends with a stop finish', imCall.chunks.at(-1)?.type === 'finish' && imCall.chunks.at(-1).reason?.kind === 'stop', JSON.stringify(imCall.chunks.at(-1)));
+
+const imAgain = await driveModelCall({ sessionId: imSessionId, messages: [imLine] });
+check('a bridge answer is consumed exactly once', imAgain.fellThrough === true);
+
+const imElsewhere = await driveModelCall({ sessionId: 'session-unrelated', messages: [imLine] });
+check('a bridge answer never leaks into another session', imElsewhere.fellThrough === true);
+
+const imSession2 = 'session-im-2';
+await runPreStep({
+  sessionId: imSession2,
+  messages: [imMessage([{ type: 'text', text: '/birds /root/test.wav' }, { type: 'image', attachment: { id: 'a3' } }])],
+});
+const imWrongTurn = await driveModelCall({ sessionId: imSession2, messages: [{ id: 'someone-else', role: 'user', content: [] }] });
+check('a bridge answer is not handed to a different turn', imWrongTurn.fellThrough === true);
+const imRightTurn = await driveModelCall({ sessionId: imSession2, messages: [{ id: 'm-im', role: 'user', content: [] }] });
+check('the parked answer survives until its own turn asks for it', imRightTurn.fellThrough === false);
 
 const imPlain = await runPreStep({ messages: [imMessage([{ type: 'text', text: '帮我看看这个' }])] });
 check('an IM message without a command is left to the model', imPlain.fellThrough === true && imPlain.appended.length === 0);
