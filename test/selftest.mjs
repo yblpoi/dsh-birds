@@ -24,6 +24,8 @@ import { bindLabels, chineseName, labelDigest, nameTableStatus, resetNameTables 
 import { parseBridgeEnvelope, quotedMediaNames, resolveQuotedMedia } from '../lib/im/quoted.mjs';
 import { patchDshImSource, isPatched, UnsupportedBundleError, MARKER } from '../scripts/patch-dsh-im.mjs';
 
+const PKG_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
 let failures = 0;
 function check(label, condition, detail) {
   if (condition) {
@@ -261,6 +263,7 @@ check('the model table covers images, audio and geo', ['imageModel', 'audioModel
 const mirrored = modelTargets({ hfMirror: 'https://mirror.example' });
 check('an hf mirror is spliced into the huggingface routes', mirrored.some((target) => target.urls.some((url) => url.startsWith('https://mirror.example/'))), String(mirrored.length));
 check('the user agent is not bare node', USER_AGENT.startsWith('dsh-birds/'), USER_AGENT);
+check('the user agent carries the shipped version', USER_AGENT.startsWith('dsh-birds/' + PKG_VERSION + ' '), USER_AGENT);
 check('ffmpeg build is pinned', FFMPEG_BUILD === 'b6.0', FFMPEG_BUILD);
 
 const linuxArm = ffmpegTargetFor('linux', 'arm64');

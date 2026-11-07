@@ -251,7 +251,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 139 + 72 + 20 + 67 = 298 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 140 + 72 + 20 + 67 = 299 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `hs`/`kVe` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；引用图变成附件并走平台白名单，重复/无 url/非图片/非白名单域名不搬 |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
