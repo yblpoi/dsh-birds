@@ -10,6 +10,7 @@ import { planChunks as pc } from '../lib/audio/chunk.mjs';
 import {
   USER_AGENT,
   FFMPEG_BUILD,
+  GITHUB_RELAY,
   modelTargets,
   ffmpegTargetFor,
   ffmpegBinaryName,
@@ -214,7 +215,10 @@ const models = modelTargets({});
 check('provisioning knows six model files', models.length === 6, String(models.length));
 check('every model pins a byte count and a sha256', models.every((target) => target.bytes > 0 && /^[0-9a-f]{64}$/.test(target.sha256)), JSON.stringify(models.map((t) => t.file)));
 check('every model has an https route', models.every((target) => target.urls.length >= 1 && target.urls.every((url) => url.startsWith('https://'))), JSON.stringify(models.map((target) => target.urls.length)));
-check('the mirrored models keep a second route', models.filter((target) => target.key !== 'geoModel' && target.key !== 'geoLabels').every((target) => target.urls.length >= 2), JSON.stringify(models.map((target) => target.key + ':' + target.urls.length)));
+check('every model keeps a second route', models.every((target) => target.urls.length >= 2), JSON.stringify(models.map((target) => target.key + ':' + target.urls.length)));
+// github.com release assets (geomodel) are unreachable on some mobile
+// networks, so those two targets route through a relay as well.
+check('github-hosted models carry the relay route', ['geoModel', 'geoLabels'].every((key) => models.find((target) => target.key === key).urls.some((url) => url.startsWith(GITHUB_RELAY + '/https://github.com/'))), JSON.stringify(models.filter((t) => t.key.startsWith('geo')).map((t) => t.urls)));
 check('the model table covers images, audio and geo', ['imageModel', 'audioModel', 'geoModel'].every((key) => models.some((target) => target.key === key)), JSON.stringify(models.map((t) => t.key)));
 const mirrored = modelTargets({ hfMirror: 'https://mirror.example' });
 check('an hf mirror is spliced into the huggingface routes', mirrored.some((target) => target.urls.some((url) => url.startsWith('https://mirror.example/'))), String(mirrored.length));
@@ -234,7 +238,7 @@ check('ffmpeg names the platform binary', ffmpegBinaryName('win32') === 'ffmpeg.
 check('an unshipped platform is reported as unsupported', unsupported.unsupported === true, JSON.stringify(unsupported));
 check('unsupported platforms still yield no fake size', unsupported.bytes === 0, String(unsupported.bytes));
 check('ffmpeg installs under the models directory', ffmpegInstallPath('/m', 'linux') === '/m/bin/ffmpeg' && ffmpegInstallPath('/m', 'win32') === '/m/bin/ffmpeg.exe', ffmpegInstallPath('/m', 'linux'));
-check('ffmpeg links come from two hosts', linuxArm.urls.length === 2 && new Set(linuxArm.urls.map((url) => new URL(url).host)).size === 2, JSON.stringify(linuxArm.urls));
+check('ffmpeg links come from several hosts', linuxArm.urls.length >= 2 && new Set(linuxArm.urls.map((url) => new URL(url).host)).size >= 2, JSON.stringify(linuxArm.urls));
 
 // plan() is the readiness gate /birds and /birdstatus both consult.
 const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-provision-'));
@@ -295,6 +299,20 @@ const runningLine = formatProvisioning({ running: true, doneFiles: 2, totalFiles
 check('a running download reports files and megabytes', runningLine.includes('2/7') && runningLine.includes('audioModel') && runningLine.includes('25%'), runningLine);
 const failedLine = formatProvisioning({ running: false, doneFiles: 3, totalFiles: 7, error: 'HTTP 403', autoDownload: true, pendingFiles: 4 });
 check('a failed download keeps the reason', failedLine.includes('403') && failedLine.includes('续传'), failedLine);
+const failedNamed = formatProvisioning({
+  running: false,
+  doneFiles: 5,
+  totalFiles: 7,
+  error: '2 个文件下载失败',
+  autoDownload: true,
+  pendingFiles: 2,
+  errors: [{ file: 'geoModel' }, { file: 'geoLabels' }],
+});
+check(
+  'a failed download names the files and promises a retry',
+  failedNamed.includes('geoModel') && failedNamed.includes('geoLabels') && failedNamed.includes('自动重试'),
+  failedNamed,
+);
 const pendingLine = formatProvisioning({ running: false, totalFiles: 0, doneFiles: 0, autoDownload: false, pendingFiles: 7 });
 check('a never-started download counts what is pending', pendingLine.includes('7') && pendingLine.includes('自动下载已关闭'), pendingLine);
 const localLine = formatProvisioning({ running: false, totalFiles: 0, doneFiles: 0, autoDownload: true, pendingFiles: 0 });

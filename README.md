@@ -137,6 +137,8 @@ npm install --force
 
 第一次 `/birds` 落在下载没完成的时候，会直接回一句「正在后台下载 x/y 个文件」，不会报模型缺失，也不会去调大模型。下载完成后重发即可；中断过的文件按 `.part` 续传，落盘前会同时校验字节数与 SHA-256。
 
+线路抖动导致有文件没下完时，插件会自己重试（2 分钟、10 分钟、30 分钟各一次），不需要人盯着；`/birdstatus` 会把没下成功的文件名和原因写出来。
+
 > 为什么不用 npm 的 `postinstall`：npm 会把带安装脚本的 git 依赖判定为需要人工放行（`EALLOWSCRIPTS`），手机 profile 里没人能点那个确认，安装会直接失败。所以自动安装放在插件加载时，安装命令保持纯粹。
 
 想手动重跑（可选，等价入口）：`dsh-birds-models`（profile 的 `node_modules/.bin/` 里），或
@@ -156,11 +158,13 @@ node scripts/download-models.mjs
 | `BirdTrace-FastViT-MA36-10K.classes.json` | 1,000,770 B | 同上 `classes.json` |
 | `BirdNET+_V3.0-preview3.1_Global_11K_FP16_pruned.onnx` | 71,528,628 B | `https://zenodo.org/records/20703646/files/…?download=1` |
 | `BirdNET+_V3.0-preview3.1_Global_11K_Labels.csv` | 809,172 B | 同上 |
-| `BirdNET+_Geomodel_V3.0.4_Global_14K_FP16.onnx` | 7,885,053 B | `https://github.com/birdnet-team/geomodel/releases/download/v3.0.4/…` |
+| `BirdNET+_Geomodel_V3.0.4_Global_14K_FP16.onnx` | 7,885,053 B | `https://github.com/birdnet-team/geomodel/releases/download/v3.0.4/…` → `https://gh-proxy.com/<原地址>` |
 | `BirdNET+_Geomodel_V3.0.4_Global_14K_Labels.txt` | 671,823 B | 同上 |
-| `bin/ffmpeg`（静态二进制） | 45–81 MB，按平台 | `ffmpeg-static` b6.0：`cdn.npmmirror.com` → GitHub Releases |
+| `bin/ffmpeg`（静态二进制） | 45–81 MB，按平台 | `ffmpeg-static` b6.0：`cdn.npmmirror.com` → GitHub Releases → `gh-proxy.com` |
 
 > **为什么要用 hf-mirror**：`huggingface.co`、`cdn.jsdelivr.net`、`raw.githubusercontent.com` 在部分网络环境下直连超时，而 `hf-mirror.com`、`zenodo.org`、`github.com` 通常可用。Zenodo 与 GitHub Releases 都支持 Range 请求，所以脚本能断点续传，手机上一次下不完可以再跑一次。
+>
+> **GitHub Releases 也可能整条不通**：Geomodel 只在 GitHub Releases 上有，而某些移动网络下 `github.com` 会连续 `UND_ERR_CONNECT_TIMEOUT`（实测手机上约 10 秒必超时）。所以每个 GitHub 资源都额外挂了一条 `https://gh-proxy.com/<原地址>` 中转线路——它返回的是同一份字节，大小与 SHA-256 校验不变，只在前一条线路失败时启用。
 
 **下载失败时先跑自检**，它只发 `Range: bytes=0-0` 探测每条线路，不写任何文件：
 
@@ -328,7 +332,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 100 项 + `hosttest` 50 项 + `imports` 16 项，共 166 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 102 项 + `hosttest` 50 项 + `imports` 16 项，共 168 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

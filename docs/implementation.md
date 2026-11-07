@@ -162,6 +162,8 @@ npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-bird
 # ③ 重启 DSH：模型（约 250 MB）与静态 ffmpeg（约 50 MB）由插件自动下载，
 #    进度看 /birdstatus；不需要手动跑脚本
 #    宿主机 PATH 里已有 ffmpeg 时只补模型，不再下那 50 MB 自带副本
+#    Geomodel 只在 GitHub Releases 上，某些移动网络直连会连续超时，
+#    因此它额外挂了 https://gh-proxy.com/<原地址> 中转线路（同一份字节，校验不变）
 
 # ④ 在会话里敲（两个命令都应出现在命令面板里）
 /birdstatus          # 六个模型文件与推理引擎状态
@@ -198,7 +200,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 62 + 45 + 14 = 121 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 102 + 50 + 16 = 168 条断言全 PASS |
 
 ---
 
