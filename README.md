@@ -48,8 +48,10 @@ dsh-birds/
 │   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
 │   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
+│   ├── im/quoted.mjs            引用消息回查（按平台文件名找回本机上的引用图）
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
 ├── scripts/download-models.mjs  模型下载（支持断点续传）
+├── scripts/patch-dsh-im.mjs     给 dsh-im 补一处：QQ 引用图变成真正的附件
 ├── docs/implementation.md       实施方案与模型核对笔记
 └── test/
     ├── selftest.mjs             WAV/重采样/分块/排版 单元自测
@@ -253,17 +255,40 @@ dsh-im 这类聊天桥只转发 **assistant 文本**：它不渲染 `command/run
 
 ### QQ 里「引用」一张图片也能识别
 
-dsh-im 把「引用」当**元数据**转发：被引用的那条消息在 Harness 里只留下一个信封 —— `<dsh_im_reply_to>{"attachments":[{"kind":"image","name":"6527E319….jpg"}]}</dsh_im_reply_to>`，平台的 CDN 地址在进入 Harness 之前就被丢掉了，被引用的图片也不会作为图片部件出现。所以最早在 QQ 里引用一张鸟图再打 `/birds`，插件看不到任何附件，只能回「没有收到图片或录音」。
+dsh-im 把「引用」当**元数据**转发：被引用的那条消息在 Harness 里只留下一个信封 —— `<dsh_im_reply_to>{"attachments":[{"kind":"image","name":"6527E319….jpg"}]}</dsh_im_reply_to>`。**平台的 CDN 地址在这一步被丢了**，被引用的图片也不会作为图片部件出现。
 
-图片字节其实就**在本机**：dsh-im 为了自己记群聊，会把收到的消息写进 `~/.dsh/integrations/dsh-im/group-history.sqlite`（附件那一行带 `name` 和 `group-files/…` 相对路径），也会把它收到的图片落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都按**平台文件名**索引，而那正是引用信封里唯一保留下来的字段。于是 `lib/im/quoted.mjs` 按名回查：
+这里有个值得记下来的事实：QQ 的推送**本来就带着图片地址**。`@tencent-connect/qqbot-nodejs` 的 `QuotedAttachment` 类型就是 `{ contentType, url, filename?, asrText? }`，来源是 `msg_elements[0].attachments`；dsh-im 自己的 `qqReplyReference()` 也读了这个对象，只是映射时只留 `{ kind, name }`，把 `url` 扔掉了（5.8.0 与 5.10.0 都是如此，升级不解决）。
+
+所以引用图有两条路：
+
+**① 补 dsh-im 一处洞（推荐）** —— 让引用图变成**真正的附件**：
+
+```bash
+cd ~/.dsh/profiles/desktop
+node node_modules/dsh-birds/scripts/patch-dsh-im.mjs        # 先 --dry-run 看会不会改
+# 改完重启 DSH（或重启 App）
+```
+
+脚本只改一件事：在 dsh-im 的 inbound 构造器（`lib/index.js` 里 `function rY(n,{fetchImpl:t=fetch}={}){…}`）追加一句，把引用附件里有 `https` 地址、且不在本条消息已有附件里的**图片**塞进本条消息的 `images` 列表 —— 走的完全是普通图片那条 Harness 附件通道（dsh-im 自己的下载函数 + 平台 CDN 白名单），失败也只是这张图当没引。于是 `/birds` 和模型都能看到引用图。
+
+几个必须知道的点：
+
+- **改的是第三方插件的构建产物**，dsh-im 升级或 profile 重装会覆盖掉，重跑脚本即可（已有补丁会自动识别，不会重复打）。
+- 原文件先备份成 `lib/index.js.orig-xxxxxxxx`，`--restore=<备份路径>` 可还原。
+- 脚本按 5.8.0 的压缩产物定位（两处锚点各命中一次才动手）；认不出就**拒绝改**并说明原因，宁可不改也不乱改。
+- 只搬运图片。引用语音/文件仍按元数据处理，避免把不支持的格式硬塞进附件通道。
+
+**② 不打补丁时** —— 插件按文件名回查本机，只覆盖「发给过机器人的图」：
+
+dsh-im 为了自己记群聊，会把收到的消息写进 `~/.dsh/integrations/dsh-im/group-history.sqlite`（附件那一行带 `name` 和 `group-files/…` 相对路径），也会把它收到的图片落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都按**平台文件名**索引，而那正是引用信封里唯一保留下来的字段。于是 `lib/im/quoted.mjs` 按名回查：
 
 1. 先用 `<dsh_im_source>` 里的 `channel` + `chatId` 定位群，在历史库里找 `status = 'ready'`、文件仍在盘的**同名**附件，读 `relative_path` 拼出绝对路径；
 2. 历史库缺失或没命中，再扫 `.dsh-im/inbound/**`（兼容 `01-1-<name>` 这种前缀）；
-3. 都找不到就**明说**：只有发给过机器人的图片才会被存下来，群里别人的原图拿不到 —— 把图片和 `/birds` 发在同一条消息里即可。
+3. 都找不到就**明说**：只有发给过机器人的图片才会被存下来，群里别人的原图拿不到 —— 打上面的补丁，或把图片和 `/birds` 发在同一条消息里。
 
 取到的文件仍然要过 `classifyFile()` 的**内容嗅探**才算数（名字后缀不可信）；结果里的「文件：…」显示的是那张图在 QQ 里的原始文件名（而不是本机的内容寻址 blob 名），末尾再加一行「（来自你引用的那条消息）」。
 
-安全边界：历史库只读打开（`node:sqlite` 的 `readOnly`），只按文件名精确匹配（inbound 里也只认 `-<name>` 后缀），不会顺着信封去读任意路径；群里别人的图不在库里，也就无从读到。
+安全边界：历史库只读打开（`node:sqlite` 的 `readOnly`），只按文件名精确匹配（inbound 里也只认 `-<name>` 后缀），不会顺着信封去读任意路径；群里别人的图不在库里，也就无从读到。补丁那条路也只下载平台 CDN 白名单里的地址，不碰任意域名。
 
 ### 可选：Telegram 桥
 
@@ -377,7 +402,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 129 项 + `hosttest` 66 项 + `imports` 18 项，共 213 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 138 项 + `hosttest` 66 项 + `imports` 18 项，共 222 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

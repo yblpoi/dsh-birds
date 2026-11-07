@@ -22,6 +22,7 @@ import { configureFfmpeg, describeFfmpeg, localFfmpegPath, provisionedFfmpegPath
 import { formatProvisioning } from '../lib/format.mjs';
 import { bindLabels, chineseName, labelDigest, nameTableStatus, resetNameTables } from '../lib/names.mjs';
 import { parseBridgeEnvelope, quotedMediaNames, resolveQuotedMedia } from '../lib/im/quoted.mjs';
+import { patchDshImSource, isPatched, UnsupportedBundleError, MARKER } from '../scripts/patch-dsh-im.mjs';
 
 let failures = 0;
 function check(label, condition, detail) {
@@ -447,5 +448,59 @@ check('a staged inbound image is found by its platform name', staged.files[0]?.p
 const noMedia = await resolveQuotedMedia({ replyTo: { content: '只有文字' }, dshHome: quotedRoot });
 check('a text-only quote resolves to nothing instead of throwing', noMedia.files.length === 0 && noMedia.unresolved.length === 0);
 fs.rmSync(quotedRoot, { recursive: true, force: true });
+
+// ---- dsh-im build patch: quoted QQ images must become real attachments ----
+// The bridge keeps only { kind, name } for a quoted attachment. The patch
+// rewrites its inbound builder so the CDN url it already holds also lands in
+// the message's images list, which is how an ordinary photo arrives.
+const MINI_IM_BUNDLE = [
+  'function iY(n){return null}',
+  'function aC(n){return n?.content??""}',
+  'function hs(u){return u}',
+  'const kVe=[".qpic.cn"];',
+  'async function UVe(u){return u}',
+  'function rY(n,{fetchImpl:t=fetch}={}){let o=[],a=[];let e=iY(n);return{content:aC(n),images:o,files:a,...e?{replyTo:e}:{}}}',
+].join('\n');
+const patchedIm = patchDshImSource(MINI_IM_BUNDLE);
+check('the dsh-im patch rewrites the inbound builder', patchedIm.includes(MARKER) && patchedIm.includes('for(const __q of __qbQuotedMedia(n,t))o.push(__q)'));
+check('the dsh-im patch is idempotent', isPatched(patchedIm) && patchDshImSource(patchedIm) === patchedIm);
+let refused;
+try {
+  patchDshImSource('function somethingElse(){}');
+} catch (error) {
+  refused = error;
+}
+check('the dsh-im patch refuses an unrecognised bundle', refused instanceof UnsupportedBundleError && /认不出/.test(refused.message));
+
+const helperSource = patchedIm.slice(patchedIm.indexOf('function __qbQuotedMedia'), patchedIm.indexOf('function rY'));
+const quotedMediaOf = new Function('hs', 'kVe', helperSource + '; return __qbQuotedMedia;');
+let fetched;
+const stubHs = async (url, options) => {
+  fetched = { url, options };
+  return Buffer.from('pixels');
+};
+const promote = quotedMediaOf(stubHs, ['.qpic.cn']);
+const promoted = promote({
+  attachments: [{ url: 'https://gchat.qpic.cn/original.jpg', name: 'already.jpg' }],
+  msgElements: [{ attachments: [
+    { url: 'https://gchat.qpic.cn/quoted.jpg', filename: 'QUOTED.jpg', content_type: 'image/jpeg' },
+    { url: 'https://gchat.qpic.cn/original.jpg', filename: 'already.jpg', content_type: 'image/jpeg' },
+    { url: 'http://gchat.qpic.cn/plain.jpg', filename: 'PLAIN.jpg', content_type: 'image/jpeg' },
+    { filename: 'NOURL.jpg', content_type: 'image/jpeg' },
+    { url: 'https://gchat.qpic.cn/voice.mp3', filename: 'VOICE.mp3', content_type: 'audio/mpeg' },
+  ] }],
+});
+check('a quoted QQ image becomes a real attachment', promoted.length === 1 && promoted[0].name === 'QUOTED.jpg' && promoted[0].mediaType === 'image/jpeg', JSON.stringify(promoted));
+const promotedBytes = await promoted[0].load({});
+check('the promoted image loads through the platform allowlist', promotedBytes.toString() === 'pixels' && fetched?.url === 'https://gchat.qpic.cn/quoted.jpg' && fetched?.options?.allowedHosts?.includes('.qpic.cn'), JSON.stringify(fetched));
+const ownFetch = async () => Buffer.from('own');
+const ownPromoted = promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/own.jpg', filename: 'OWN.jpg', content_type: 'image/jpeg' }] }] }, ownFetch);
+await ownPromoted[0].load({});
+check('the promoted image reuses dsh-im own fetch implementation', fetched?.options?.fetchImpl === ownFetch);
+check('a quoted url outside the platform hosts is left alone', promote({ msgElements: [{ attachments: [{ url: 'https://cdn.example.com/x.jpg', filename: 'X.jpg', content_type: 'image/jpeg' }] }] }).length === 1);
+check('a quoted picture that is already attached is not duplicated', promote({ attachments: [{ url: 'https://gchat.qpic.cn/dup.jpg' }], msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/dup.jpg', filename: 'D.jpg', content_type: 'image/jpeg' }] }] }).length === 0);
+check('a quoted voice message is not treated as a picture', promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/v.mp3', filename: 'V.mp3', content_type: 'audio/mpeg' }] }] }).length === 0);
+check('a quoted picture with no url is skipped', promote({ msgElements: [{ attachments: [{ filename: 'A.jpg', content_type: 'image/jpeg' }] }] }).length === 0);
+
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);
