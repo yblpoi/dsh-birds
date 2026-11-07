@@ -278,7 +278,14 @@ check('ffmpeg has a win32 x64 build', winX64.bytes === 81_114_624, JSON.stringif
 check('ffmpeg names the platform binary', ffmpegBinaryName('win32') === 'ffmpeg.exe' && ffmpegBinaryName('linux') === 'ffmpeg', ffmpegBinaryName('win32'));
 check('an unshipped platform is reported as unsupported', unsupported.unsupported === true, JSON.stringify(unsupported));
 check('unsupported platforms still yield no fake size', unsupported.bytes === 0, String(unsupported.bytes));
-check('ffmpeg installs under the models directory', ffmpegInstallPath('/m', 'linux') === '/m/bin/ffmpeg' && ffmpegInstallPath('/m', 'win32') === '/m/bin/ffmpeg.exe', ffmpegInstallPath('/m', 'linux'));
+// 用 path.join 拼期望值：在 Windows 上它给出反斜杠，写死 '/' 的分隔符只会在
+// Linux 上碰巧对上，真机跑 npm test 会红。
+check(
+  'ffmpeg installs under the models directory',
+  ffmpegInstallPath('/m', 'linux') === path.join('/m', 'bin', 'ffmpeg')
+    && ffmpegInstallPath('/m', 'win32') === path.join('/m', 'bin', 'ffmpeg.exe'),
+  ffmpegInstallPath('/m', 'linux'),
+);
 check('ffmpeg links come from several hosts', linuxArm.urls.length >= 2 && new Set(linuxArm.urls.map((url) => new URL(url).host)).size >= 2, JSON.stringify(linuxArm.urls));
 
 // plan() is the readiness gate /birds and /birdstatus both consult.
@@ -407,15 +414,38 @@ try {
 } catch {
   sqliteModule = undefined;
 }
+// QQ sends a voice message with no filename at all, so the quoted entry has no
+// name to look up. The quote still names the message it points at, and the
+// history store keys its rows by that platform id — which is what the unnamed
+// path uses.
+const quotedVoiceDir = path.join(quotedIntegration, 'group-files', 'group-2', 'message-2');
+fs.mkdirSync(quotedVoiceDir, { recursive: true });
+const quotedVoiceBlob = path.join(quotedVoiceDir, 'attachment-2');
+fs.writeFileSync(quotedVoiceBlob, Buffer.concat([Buffer.from('#!AMR'), Buffer.alloc(64)]));
+
 if (sqliteModule !== undefined) {
   const history = new sqliteModule.DatabaseSync(path.join(quotedIntegration, 'group-history.sqlite'));
   history.exec('create table groups (id text primary key, channel text, platform_group_id text)');
-  history.exec('create table messages (id text primary key, group_id text, sent_at integer)');
+  history.exec('create table messages (id text primary key, group_id text, platform_message_id text, sent_at integer)');
   history.exec('create table attachments (id text primary key, message_id text, name text, mime_type text, size_bytes integer, relative_path text, status text)');
   history.prepare('insert into groups (id, channel, platform_group_id) values (?, ?, ?)').run('g1', 'qq', 'G-QUOTE');
-  history.prepare('insert into messages (id, group_id, sent_at) values (?, ?, ?)').run('m1', 'g1', 1);
+  history.prepare('insert into messages (id, group_id, platform_message_id, sent_at) values (?, ?, ?, ?)').run('m1', 'g1', 'PLATFORM-1', 1);
   history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
     .run('a1', 'm1', 'A1B2C3.jpg', 'image/jpeg', 68, 'group-files/group-1/message-1/attachment-1', 'ready');
+  history.prepare('insert into messages (id, group_id, platform_message_id, sent_at) values (?, ?, ?, ?)').run('m2', 'g1', 'PLATFORM-2', 2);
+  history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
+    .run('a2', 'm2', 'file-1', 'audio/amr', 68, 'group-files/group-2/message-2/attachment-2', 'ready');
+  // One message can carry two recordings; both are unnamed in the quote, so
+  // they must not collapse onto the same row.
+  history.prepare('insert into messages (id, group_id, platform_message_id, sent_at) values (?, ?, ?, ?)').run('m3', 'g1', 'PLATFORM-3', 3);
+  const secondVoiceDir = path.join(quotedIntegration, 'group-files', 'group-2', 'message-3');
+  fs.mkdirSync(secondVoiceDir, { recursive: true });
+  fs.writeFileSync(path.join(secondVoiceDir, 'attachment-3'), Buffer.concat([Buffer.from('#!AMR'), Buffer.alloc(64)]));
+  fs.writeFileSync(path.join(secondVoiceDir, 'attachment-4'), Buffer.concat([Buffer.from('#!AMR'), Buffer.alloc(64)]));
+  history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
+    .run('a3', 'm3', 'file-1', 'audio/amr', 68, 'group-files/group-2/message-3/attachment-3', 'ready');
+  history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
+    .run('a4', 'm3', 'file-2', 'audio/amr', 68, 'group-files/group-2/message-3/attachment-4', 'ready');
   history.close();
 }
 
@@ -435,6 +465,24 @@ if (sqliteModule !== undefined) {
   check('the recovered blob is the quoted picture', (await classifyFile(recovered.files[0]?.path)) === 'image');
   const neverReceived = await resolveQuotedMedia({ replyTo: { attachments: [{ kind: 'image', name: 'NOPE.jpg' }] }, source: quotedEnvelope.source, dshHome: quotedRoot });
   check('an image the bot never received stays unresolved', neverReceived.files.length === 0 && neverReceived.unresolved[0]?.name === 'NOPE.jpg', JSON.stringify(neverReceived));
+
+  // The regression this fix is about: a quoted recording never has a name.
+  const voiceQuote = { messageId: 'PLATFORM-2', attachments: [{ kind: 'audio' }] };
+  check('an unnamed quoted recording is still an attachment', quotedMediaNames(voiceQuote).length === 1
+    && quotedMediaNames(voiceQuote)[0].kind === 'audio', JSON.stringify(quotedMediaNames(voiceQuote)));
+  const voice = await resolveQuotedMedia({ replyTo: voiceQuote, source: quotedEnvelope.source, dshHome: quotedRoot });
+  check('a quoted recording with no name is found through its message id', voice.files[0]?.path === quotedVoiceBlob, JSON.stringify(voice));
+  check('the recovered blob really is the quoted recording', (await classifyFile(voice.files[0]?.path)) === 'audio');
+  const voiceUnknown = await resolveQuotedMedia({ replyTo: { messageId: 'PLATFORM-NOPE', attachments: [{ kind: 'audio' }] }, source: quotedEnvelope.source, dshHome: quotedRoot });
+  check('a recording the bot never received stays unresolved', voiceUnknown.files.length === 0 && voiceUnknown.unresolved[0]?.kind === 'audio', JSON.stringify(voiceUnknown));
+  const namedFileQuote = { attachments: [{ kind: 'file' }] };
+  check('an unnamed plain file is not guessed at', quotedMediaNames(namedFileQuote).length === 0);
+
+  const twoVoices = { messageId: 'PLATFORM-3', attachments: [{ kind: 'audio' }, { kind: 'audio' }] };
+  const both = await resolveQuotedMedia({ replyTo: twoVoices, source: quotedEnvelope.source, dshHome: quotedRoot });
+  check('two unnamed recordings resolve to two distinct blobs',
+    both.files.length === 2 && both.files[0].path !== both.files[1].path, JSON.stringify(both));
+  check('neither of them is reported as missing', both.unresolved.length === 0, JSON.stringify(both.unresolved));
 }
 
 const stagedDir = path.join(quotedRoot, 'im', '.dsh-im', 'inbound', '20261107-120000-AAAAAA');
@@ -452,20 +500,30 @@ const noMedia = await resolveQuotedMedia({ replyTo: { content: '只有文字' },
 check('a text-only quote resolves to nothing instead of throwing', noMedia.files.length === 0 && noMedia.unresolved.length === 0);
 fs.rmSync(quotedRoot, { recursive: true, force: true });
 
-// ---- dsh-im build patch: quoted QQ images must become real attachments ----
-// The bridge keeps only { kind, name } for a quoted attachment. The patch
-// rewrites its inbound builder so the CDN url it already holds also lands in
-// the message's images list, which is how an ordinary photo arrives.
+// ---- dsh-im build patch: quoted media must become real attachments ----
+// The bridge keeps only { kind, name } for a quoted attachment — and a QQ voice
+// message has no name at all. The patch rewrites the inbound builder so the url
+// it still holds is put back on the message: pictures into images, everything
+// else into files. dsh-im then downloads both itself, stages the recording under
+// .dsh-im/inbound/ and announces it in a <dsh_im_files> manifest.
+// Shaped like the real 5.10.0 builder: the two downloaders sit right after a
+// fixed error message, which is how the patch finds their (mangled) names.
 const MINI_IM_BUNDLE = [
-  'function iY(n){return null}',
-  'function aC(n){return n?.content??""}',
-  'function hs(u){return u}',
-  'const kVe=[".qpic.cn"];',
-  'async function UVe(u){return u}',
-  'function rY(n,{fetchImpl:t=fetch}={}){let o=[],a=[];let e=iY(n);return{content:aC(n),images:o,files:a,...e?{replyTo:e}:{}}}',
+  'function FY(n){return null}',
+  'function hC(n){return n?.content??""}',
+  'async function Bs(u,o){return Buffer.from("pixels")}',
+  'async function N5e(u,o){return Buffer.from("audio")}',
+  'const D5e=Object.freeze([".qpic.cn"]);',
+  'function LY(n,{fetchImpl:t=fetch}={}){let o=[],a=[];',
+  'for(const i of n?.attachments??[]){',
+  'if(i.pic){o.push({load:({signal:sg,maxBytes:mb}={})=>{if(!i.url)throw new Error("QQ image attachment has no download URL");return Bs(i.url,{fetchImpl:t,signal:sg,maxBytes:mb,allowedHosts:D5e})}});continue;}',
+  'a.push({load:({signal:sg}={})=>{if(!i.url)throw new Error("QQ file attachment has no download URL");return N5e(i.url,{fetchImpl:t,signal:sg})}});',
+  '}',
+  'let e=FY(n);return{content:hC(n),images:o,files:a,...e?{replyTo:e}:{}}}',
 ].join('\n');
 const patchedIm = patchDshImSource(MINI_IM_BUNDLE);
-check('the dsh-im patch rewrites the inbound builder', patchedIm.includes(MARKER) && patchedIm.includes('for(const __q of __qbQuotedMedia(n,t))o.push(__q)'));
+check('the dsh-im patch rewrites the inbound builder', patchedIm.includes(MARKER)
+  && patchedIm.includes('for(const __q of __qbQuotedMedia(n,t)){if(__q.kind==="image")o.push(__q.value);else a.push(__q.value);}'));
 check('the dsh-im patch is idempotent', isPatched(patchedIm) && patchDshImSource(patchedIm) === patchedIm);
 let refused;
 try {
@@ -475,14 +533,48 @@ try {
 }
 check('the dsh-im patch refuses an unrecognised bundle', refused instanceof UnsupportedBundleError && /认不出/.test(refused.message));
 
-const helperSource = patchedIm.slice(patchedIm.indexOf('function __qbQuotedMedia'), patchedIm.indexOf('function rY'));
-const quotedMediaOf = new Function('hs', 'kVe', helperSource + '; return __qbQuotedMedia;');
+// Mangled names differ between releases: the patch reads them out of the bundle
+// instead of hard-coding them. Writing them down is what broke 5.10.0 — there
+// "hs" is an assertion helper, so every promoted picture threw and got swallowed.
+const RENAMED_IM_BUNDLE = MINI_IM_BUNDLE
+  .split('function Bs(').join('function QqImage(')
+  .split('allowedHosts:D5e').join('allowedHosts:Hosts')
+  .split('const D5e=Object.freeze(').join('const Hosts=Object.freeze(')
+  .split('return Bs(i.url').join('return QqImage(i.url');
+const renamedPatched = patchDshImSource(RENAMED_IM_BUNDLE);
+const renamedHelper = renamedPatched.slice(renamedPatched.indexOf('function __qbQuotedMedia'), renamedPatched.indexOf('function LY'));
+check('the patch learns the downloader names instead of assuming them',
+  renamedHelper.includes('=>QqImage(u,') && renamedHelper.includes('Array.isArray(Hosts)?Hosts'), renamedHelper.slice(0, 160));
+// Same anchors, but the image downloader the hint points at is not declared:
+// producing a patch here would ship a helper that throws on every use.
+const brokenBundle = MINI_IM_BUNDLE.split('function Bs(').join('function QqImage(');
+let brokenRefused;
+try {
+  patchDshImSource(brokenBundle);
+} catch (error) {
+  brokenRefused = error;
+}
+check('the patch refuses a bundle whose downloader it cannot find',
+  brokenRefused instanceof UnsupportedBundleError && /下载器/.test(brokenRefused.message),
+  brokenRefused === undefined ? 'no error' : brokenRefused.message);
+
+// The helper is pulled out of the patched bundle and exercised against stubs,
+// so the test measures the code dsh-im will really run.
+const helperSource = patchedIm.slice(patchedIm.indexOf('function __qbQuotedMedia'), patchedIm.indexOf('function LY'));
+const quotedMediaOf = new Function('Bs', 'N5e', 'D5e', helperSource + '; return __qbQuotedMedia;');
 let fetched;
-const stubHs = async (url, options) => {
+const stubBs = async (url, options) => {
   fetched = { url, options };
   return Buffer.from('pixels');
 };
-const promote = quotedMediaOf(stubHs, ['.qpic.cn']);
+let fetchedFile;
+const stubN5e = async (url, options) => {
+  fetchedFile = { url, options };
+  return Buffer.from('audio');
+};
+const promote = quotedMediaOf(stubBs, stubN5e, Object.freeze(['.qpic.cn']));
+const imagesOf = (result) => result.filter((entry) => entry.kind === 'image').map((entry) => entry.value);
+const filesOf = (result) => result.filter((entry) => entry.kind === 'file').map((entry) => entry.value);
 const promoted = promote({
   attachments: [{ url: 'https://gchat.qpic.cn/original.jpg', name: 'already.jpg' }],
   msgElements: [{ attachments: [
@@ -493,16 +585,33 @@ const promoted = promote({
     { url: 'https://gchat.qpic.cn/voice.mp3', filename: 'VOICE.mp3', content_type: 'audio/mpeg' },
   ] }],
 });
-check('a quoted QQ image becomes a real attachment', promoted.length === 1 && promoted[0].name === 'QUOTED.jpg' && promoted[0].mediaType === 'image/jpeg', JSON.stringify(promoted));
-const promotedBytes = await promoted[0].load({});
-check('the promoted image loads through the platform allowlist', promotedBytes.toString() === 'pixels' && fetched?.url === 'https://gchat.qpic.cn/quoted.jpg' && fetched?.options?.allowedHosts?.includes('.qpic.cn'), JSON.stringify(fetched));
+check('a quoted QQ image becomes a real attachment', imagesOf(promoted).length === 1
+  && imagesOf(promoted)[0].name === 'QUOTED.jpg' && imagesOf(promoted)[0].mediaType === 'image/jpeg', JSON.stringify(promoted));
+const promotedBytes = await imagesOf(promoted)[0].load({});
+check('the promoted image loads through the platform allowlist', promotedBytes.toString() === 'pixels'
+  && fetched?.url === 'https://gchat.qpic.cn/quoted.jpg' && fetched?.options?.allowedHosts?.includes('.qpic.cn'), JSON.stringify(fetched));
 const ownFetch = async () => Buffer.from('own');
 const ownPromoted = promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/own.jpg', filename: 'OWN.jpg', content_type: 'image/jpeg' }] }] }, ownFetch);
-await ownPromoted[0].load({});
+await imagesOf(ownPromoted)[0].load({});
 check('the promoted image reuses dsh-im own fetch implementation', fetched?.options?.fetchImpl === ownFetch);
-check('a quoted url outside the platform hosts is left alone', promote({ msgElements: [{ attachments: [{ url: 'https://cdn.example.com/x.jpg', filename: 'X.jpg', content_type: 'image/jpeg' }] }] }).length === 1);
+check('a quoted url outside the platform hosts is left alone', imagesOf(promote({ msgElements: [{ attachments: [{ url: 'https://cdn.example.com/x.jpg', filename: 'X.jpg', content_type: 'image/jpeg' }] }] })).length === 1);
 check('a quoted picture that is already attached is not duplicated', promote({ attachments: [{ url: 'https://gchat.qpic.cn/dup.jpg' }], msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/dup.jpg', filename: 'D.jpg', content_type: 'image/jpeg' }] }] }).length === 0);
-check('a quoted voice message is not treated as a picture', promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/v.mp3', filename: 'V.mp3', content_type: 'audio/mpeg' }] }] }).length === 0);
+check('a quoted voice message is not promoted as a picture', imagesOf(promoted).length === 1, JSON.stringify(imagesOf(promoted)));
+
+// The core of this fix: a quoted recording must survive QQ sending it unnamed.
+const unnamedVoice = promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/voice.amr', content_type: 'audio/amr' }] }] });
+check('a quoted recording with no filename is promoted as a file', filesOf(unnamedVoice).length === 1, JSON.stringify(unnamedVoice));
+check('an unnamed recording is given a name with a usable suffix', filesOf(unnamedVoice)[0]?.name === 'quoted-file-1.amr', JSON.stringify(filesOf(unnamedVoice)));
+check('the recording media type is kept', filesOf(unnamedVoice)[0]?.mediaType === 'audio/amr');
+await filesOf(unnamedVoice)[0].load({});
+check('the promoted recording downloads through dsh-im own file channel', fetchedFile?.url === 'https://gchat.qpic.cn/voice.amr');
+const namedVoice = promote({ msgElements: [{ attachments: [{ url: 'https://gchat.qpic.cn/v.mp3', filename: 'V.mp3', content_type: 'audio/mpeg' }] }] });
+check('a named quoted recording keeps its platform name', filesOf(namedVoice)[0]?.name === 'V.mp3', JSON.stringify(filesOf(namedVoice)));
+const mixed = filesOf(promote({ msgElements: [{ attachments: [
+  { url: 'https://gchat.qpic.cn/a.amr', content_type: 'audio/amr' },
+  { url: 'https://gchat.qpic.cn/b.amr', content_type: 'audio/amr' },
+] }] }));
+check('two unnamed recordings are numbered apart', mixed.map((entry) => entry.name).join(',') === 'quoted-file-1.amr,quoted-file-2.amr', JSON.stringify(mixed));
 check('a quoted picture with no url is skipped', promote({ msgElements: [{ attachments: [{ filename: 'A.jpg', content_type: 'image/jpeg' }] }] }).length === 0);
 
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');

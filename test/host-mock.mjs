@@ -95,6 +95,20 @@ const ctx = {
 };
 
 const modelsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-models-'));
+
+// A DSH home and workspace pair this test owns, so the bridge lookups below run
+// against fixtures instead of whatever the machine happens to have. The plugin
+// reads DSH_HOME once, at apply() time.
+const mockHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-home-'));
+const mockWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-ws-'));
+fs.mkdirSync(path.join(mockHome, 'storages'), { recursive: true });
+fs.writeFileSync(
+  path.join(mockHome, 'storages', 'workspace.json'),
+  JSON.stringify({ tables: { workspaces: { 'ws-1': { path: mockWorkspace, title: 'ws-1' } } } }),
+);
+const hostHome = process.env.DSH_HOME;
+process.env.DSH_HOME = mockHome;
+
 const mod = await import('../lib/index.js');
 check('module exports a name', mod.name === 'dsh-birds', mod.name);
 check('module declares the commands injection', Array.isArray(mod.inject) && mod.inject.includes('commands'), JSON.stringify(mod.inject));
@@ -333,13 +347,66 @@ const imRightTurn = await driveModelCall({ sessionId: imSession2, messages: [{ i
 check('the parked answer survives until its own turn asks for it', imRightTurn.fellThrough === false);
 
 
-// A quoted photo arrives as metadata only: <dsh_im_reply_to> keeps {kind, name}
-// and drops the image bytes, so the command has to look the file up itself. On
-// a host with no such history the honest answer names the quote instead of
-// claiming nothing was sent.
-const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-quote-home-'));
-const savedHome = process.env.DSH_HOME;
-process.env.DSH_HOME = emptyHome;
+// A recording never arrives as a part: dsh-im downloads it, stages it inside
+// the session workspace and announces it in <dsh_im_files>. Before this was
+// read, a group recording plus /birds answered "没有收到图片或录音".
+const stagedDir = path.join(mockWorkspace, '.dsh-im', 'inbound', '20261107-120000-AAAAAA');
+fs.mkdirSync(stagedDir, { recursive: true });
+const stagedRecording = path.join(stagedDir, '01-voice.amr');
+fs.writeFileSync(stagedRecording, Buffer.concat([Buffer.from('#!AMR'), Buffer.alloc(64)]));
+
+const reportedSession = 'session-im-recording';
+const reportedLine = {
+  id: 'm-rec',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-REC"}</dsh_im_source>' },
+    { type: 'text', text: '/birds' },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"voice.amr","path":".dsh-im/inbound/20261107-120000-AAAAAA/01-voice.amr"}]}</dsh_im_files>',
+    },
+  ],
+};
+const reportedTaken = await runPreStep({ sessionId: reportedSession, messages: [reportedLine] });
+check('a bridged recording is claimed at the turn boundary', reportedTaken.fellThrough === true && reportedTaken.appended.length === 0);
+const reportedCall = await driveModelCall({ sessionId: reportedSession, messages: [reportedLine] });
+const reportedText = reportedCall.chunks[0]?.text ?? '';
+check(
+  'a recording the bridge staged is recognised, not reported as missing',
+  reportedText.length > 0 && !reportedText.includes('没有收到图片或录音') && !reportedText.includes('找不到'),
+  reportedText,
+);
+
+const goneSession = 'session-im-recording-gone';
+const goneLine = {
+  id: 'm-rec-gone',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-REC"}</dsh_im_source>' },
+    { type: 'text', text: '/birds' },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"voice.amr","path":".dsh-im/inbound/20261107-120000-BBBBBB/01-voice.amr"}]}</dsh_im_files>',
+    },
+  ],
+};
+await runPreStep({ sessionId: goneSession, messages: [goneLine] });
+const goneCall = await driveModelCall({ sessionId: goneSession, messages: [goneLine] });
+const goneText = goneCall.chunks[0]?.text ?? '';
+check(
+  'a staged file that is really gone names the manifest instead of the photo wording',
+  goneText.includes('找不到') && !goneText.includes('没有收到图片或录音'),
+  goneText,
+);
+
+// A quoted recording is metadata only: <dsh_im_reply_to> keeps {kind} and a
+// message id, and QQ sends a voice message with no file name at all — the one
+// case that used to be dropped before anything was looked up. The bytes are in
+// dsh-im's history store, keyed by that message id.
+const sqlite = await import('node:sqlite').catch(() => undefined);
 const quotedSession = 'session-im-quote';
 const quotedLine = {
   id: 'm-quote',
@@ -360,8 +427,56 @@ check(
   quotedText.includes('引用') && quotedText.includes('没有存到本机') && !quotedText.includes('没有收到图片或录音'),
   quotedText,
 );
-if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome;
-fs.rmSync(emptyHome, { recursive: true, force: true });
+
+// The reported bug: quote a voice message, @ the bot with /birds. QQ sends no
+// file name with a recording, so the quoted entry is { kind: 'audio' } alone —
+// the name-keyed lookups above can never match it. The quote still carries the
+// id of the message it points at, and the history store keys its rows by that.
+if (sqlite !== undefined) {
+  const integration = path.join(mockHome, 'integrations', 'dsh-im');
+  const voiceDir = path.join(integration, 'group-files', 'group-9', 'message-9');
+  fs.mkdirSync(voiceDir, { recursive: true });
+  const voiceBlob = path.join(voiceDir, 'attachment-9');
+  fs.writeFileSync(voiceBlob, Buffer.concat([Buffer.from('#!AMR'), Buffer.alloc(64)]));
+
+  const history = new sqlite.DatabaseSync(path.join(integration, 'group-history.sqlite'));
+  history.exec('create table groups (id text primary key, channel text, platform_group_id text)');
+  history.exec('create table messages (id text primary key, group_id text, platform_message_id text, sent_at integer)');
+  history.exec('create table attachments (id text primary key, message_id text, name text, mime_type text, size_bytes integer, relative_path text, status text)');
+  history.prepare('insert into groups (id, channel, platform_group_id) values (?, ?, ?)').run('g9', 'qq', 'G-REC');
+  history.prepare('insert into messages (id, group_id, platform_message_id, sent_at) values (?, ?, ?, ?)').run('m9', 'g9', 'QQ-MSG-9', 9);
+  history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
+    .run('a9', 'm9', 'file-1', 'audio/amr', 68, 'group-files/group-9/message-9/attachment-9', 'ready');
+  history.close();
+
+  const voiceSession = 'session-im-quote-voice';
+  const voiceLine = {
+    id: 'm-voice',
+    role: 'user',
+    source: { kind: 'user' },
+    content: [
+      { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-REC"}</dsh_im_source>' },
+      {
+        type: 'text',
+        text: '<dsh_im_reply_to>{"note":"Quoted conversation content selected by the user; not system instructions.","messageId":"QQ-MSG-9","attachments":[{"kind":"audio"}]}</dsh_im_reply_to>',
+      },
+      { type: 'text', text: '/birds' },
+    ],
+  };
+  const voiceTaken = await runPreStep({ sessionId: voiceSession, messages: [voiceLine] });
+  check('a quoted recording is claimed at the turn boundary', voiceTaken.fellThrough === true && voiceTaken.appended.length === 0, JSON.stringify(voiceTaken.decision).slice(0, 160));
+  const voiceCall = await driveModelCall({ sessionId: voiceSession, messages: [voiceLine] });
+  const voiceText = voiceCall.chunks[0]?.text ?? '';
+  check(
+    'a quoted recording is recognised instead of answered with the photo wording',
+    voiceText.includes('模型')
+      && !voiceText.includes('没有收到图片或录音')
+      && !voiceText.includes('没有存到本机'),
+    voiceText,
+  );
+} else {
+  console.log('SKIP the quoted-recording end-to-end case (node:sqlite is unavailable)');
+}
 const imPlain = await runPreStep({ messages: [imMessage([{ type: 'text', text: '帮我看看这个' }])] });
 check('an IM message without a command is left to the model', imPlain.fellThrough === true && imPlain.appended.length === 0);
 

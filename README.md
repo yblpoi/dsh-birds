@@ -49,12 +49,13 @@ dsh-birds/
 │   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
 │   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
-│   ├── dsh-im-patch.mjs         dsh-im 引用图补丁的变换本体（设置卡与终端脚本共用）
+│   ├── dsh-im-patch.mjs         dsh-im 引用补丁的变换本体（设置卡与终端脚本共用）
 │   ├── im-patch-api.mjs         设置卡用的三条本机路由：dsh-im 补丁的状态 / 写入 / 还原
-│   ├── im/quoted.mjs            引用消息回查（按平台文件名找回本机上的引用图）
+│   ├── im/manifest.mjs          <dsh_im_files> 清单解析：桥接暂存的录音在哪
+│   ├── im/quoted.mjs            引用消息回查（按文件名或平台消息 id 找回引用附件）
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
 ├── scripts/download-models.mjs  模型下载（支持断点续传）
-├── scripts/patch-dsh-im.mjs     给 dsh-im 补一处：QQ 引用图变成真正的附件
+├── scripts/patch-dsh-im.mjs     给 dsh-im 补一处：QQ 引用的图片/语音变成真正的附件
 ├── docs/implementation.md       实施方案与模型核对笔记
 └── test/
     ├── selftest.mjs             WAV/重采样/分块/排版 单元自测
@@ -102,7 +103,10 @@ ln -sfn ~/src/dsh-birds ~/.dsh/profiles/desktop/node_modules/dsh-birds
         # geo:                     # 可选，配了就启用地理先验
         #   lat: 39.9042
         #   lon: 116.4074
+        # dshHome: ~/.dsh          # 可选，聊天桥的历史库与工作区注册表在哪
 ```
+
+`dshHome` 默认取 `$DSH_HOME`，没有就 `~/.dsh`。它只影响「引用一条群消息 / 桥接暂存文件」时去哪找字节（`integrations/dsh-im/group-history.sqlite`、`storages/workspace.json`），本地直接发文件不走这条路。
 
 重启 Host（桌面端的「重启」或 `dsh` 重启）。命令面板里应能看到 `/birds` 与 `/birdstatus`。
 
@@ -257,15 +261,17 @@ dsh-im 这类聊天桥只转发 **assistant 文本**：它不渲染 `command/run
 
 两条路径互不影响：DSH 客户端（Flutter / Web）自带附件消息仍走 `reject` + `command` 事件（结果卡片 + 「本轮已被拦截」），聊天桥走 `llm/stream`（普通回复）；两者都是 0 token。
 
-### QQ 里「引用」一张图片也能识别
+### QQ 里「引用」一张图片 / 一段语音也能识别
 
 dsh-im 把「引用」当**元数据**转发：被引用的那条消息在 Harness 里只留下一个信封 —— `<dsh_im_reply_to>{"attachments":[{"kind":"image","name":"6527E319….jpg"}]}</dsh_im_reply_to>`。**平台的 CDN 地址在这一步被丢了**，被引用的图片也不会作为图片部件出现。
+
+语音更糟：QQ 的语音消息本来就没有文件名，引用之后信封里只剩 `{"kind":"audio"}` —— 连一个能用来查文件的键都没有，早期版本读到这种引用会直接当「什么都没引用」处理，回答「没有收到图片或录音」。现在两条路都覆盖了语音（见下）。
 
 这里有个值得记下来的事实：QQ 的推送**本来就带着图片地址**。`@tencent-connect/qqbot-nodejs` 的 `QuotedAttachment` 类型就是 `{ contentType, url, filename?, asrText? }`，来源是 `msg_elements[0].attachments`；dsh-im 自己的 `qqReplyReference()` 也读了这个对象，只是映射时只留 `{ kind, name }`，把 `url` 扔掉了（5.8.0 与 5.10.0 都是如此，升级不解决）。
 
 所以引用图有两条路：
 
-**① 补 dsh-im 一处洞（推荐）** —— 让引用图变成**真正的附件**。
+**① 补 dsh-im 一处洞（推荐）** —— 让引用图/引用语音变成**真正的附件**。
 
 在设置里点一下（手机也能用）：**设置 → 插件 → dsh-birds → 配置**，会看到一张「dsh-im 引用图补丁」卡片 —— 它列出本机各个 profile 里找到的 dsh-im（路径、版本）、是否已打补丁、备份在哪，点「注入补丁」写入、点「还原」用最近的备份回滚、点「刷新」重新读状态。DSH Go（手机）的插件详情页会以网页岛把这张卡整页渲染出来，操作完全一样。改完都要重启 DSH（或重开 App）才生效。
 
@@ -277,27 +283,31 @@ node node_modules/dsh-birds/scripts/patch-dsh-im.mjs        # 先 --dry-run 看�
 # 改完重启 DSH（或重启 App）
 ```
 
-两种入口改的是同一处：在 dsh-im 的 inbound 构造器（`lib/index.js` 里 `function rY(n,{fetchImpl:t=fetch}={}){…}`）追加一句，把引用附件里有 `https` 地址、且不在本条消息已有附件里的**图片**塞进本条消息的 `images` 列表 —— 走的完全是普通图片那条 Harness 附件通道（dsh-im 自己的下载函数 + 平台 CDN 白名单），失败也只是这张图当没引。于是 `/birds` 和模型都能看到引用图。
+两种入口改的是同一处：在 dsh-im 的 inbound 构造器（5.9/5.10 里是 `function LY(n,{fetchImpl:t=fetch}={}){…}`，5.5–5.8 是 `function rY(…)`）返回前追加一句，把引用附件里带 `https` 地址、且不在本条消息已有附件里的那些搬运过来：**图片**塞进本条消息的 `images`（走 dsh-im 自己的图片下载器 + 平台 CDN 白名单），**语音和其他文件**塞进 `files`（走它自己的文件下载通道）。两条都是 dsh-im 本来就在用的通道，所以后续它自己会下载、落盘到 `.dsh-im/inbound/`、并生成 `<dsh_im_files>` 清单 —— 插件照普通附件读就行。没有文件名的语音会被补成 `quoted-file-1.amr` 这种带后缀的名字（后缀按 MIME 猜），保证下游能按扩展名分类。失败也只是这条当没引。
 
 几个必须知道的点：
 
 - **改的是第三方插件的构建产物**，dsh-im 升级或 profile 重装会覆盖掉，重跑脚本即可（已有补丁会自动识别，不会重复打）。
 - 原文件先备份成 `lib/index.js.orig-xxxxxxxx`，`--restore=<备份路径>` 可还原。
-- 脚本按 5.8.0 的压缩产物定位（两处锚点各命中一次才动手）；认不出就**拒绝改**并说明原因，宁可不改也不乱改。
-- 只搬运图片。引用语音/文件仍按元数据处理，避免把不支持的格式硬塞进附件通道。
+- 脚本按已知版本的压缩产物定位：5.9–5.10 一组锚点、5.5–5.8 一组，每组的函数锚点与返回锚点都必须各命中一次才动手；认不出就**拒绝改**并说明原因（错误里会列出每组各命中几次），宁可不改也不乱改。
+- **下载器的名字不写死**，而是从产物里探：压缩后的短名逐版本漂移（5.8.0 的图片下载器叫 `hs`，5.10.0 里 `hs` 变成了不相干的对象断言，这么写死过一次，结果补丁表面成功、实际每次搬运都抛错）。补丁会顺着 `"QQ image attachment has no download URL"` / `"QQ file attachment has no download URL"` 这两句固定文案找出 `return 下载器(...)`，再从 `allowedHosts:` 找白名单数组；找不到就拒绝打补丁，而不是生成一份必然报错的。
+- 搬运的不只是图片：引用里的语音/文件会进 `files`，由 dsh-im 自己下载落盘。找不到文件下载器时才跳过（老到没有文件通道的版本）。
 - 设置卡走的是本机 HTTP 接口（`/api/dsh-birds/dsh-im`），只接受回环请求，写入类端点还要求同源证据（`Sec-Fetch-Site` / `Origin` / 宿主 Cookie）；接口和终端脚本共用同一份补丁实现，不会各改一套。
 
 **② 不打补丁时** —— 插件按文件名回查本机，只覆盖「发给过机器人的图」：
 
 dsh-im 为了自己记群聊，会把收到的消息写进 `~/.dsh/integrations/dsh-im/group-history.sqlite`（附件那一行带 `name` 和 `group-files/…` 相对路径），也会把它收到的图片落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都按**平台文件名**索引，而那正是引用信封里唯一保留下来的字段。于是 `lib/im/quoted.mjs` 按名回查：
 
-1. 先用 `<dsh_im_source>` 里的 `channel` + `chatId` 定位群，在历史库里找 `status = 'ready'`、文件仍在盘的**同名**附件，读 `relative_path` 拼出绝对路径；
-2. 历史库缺失或没命中，再扫 `.dsh-im/inbound/**`（兼容 `01-1-<name>` 这种前缀）；
-3. 都找不到就**明说**：只有发给过机器人的图片才会被存下来，群里别人的原图拿不到 —— 打上面的补丁，或把图片和 `/birds` 发在同一条消息里。
+1. 引用信封带 `messageId` 时，直接在历史库里找**那条消息**的附件（`platform_message_id` 精确匹配）—— 这是**无文件名的语音**唯一能走的路：不看名字，按 `kind` 与附件的 MIME 类型对齐（`audio/` → audio 等）；
+2. 有文件名的，先用 `<dsh_im_source>` 里的 `channel` + `chatId` 定位群，在历史库里找 `status = 'ready'`、文件仍在盘的**同名**附件，读 `relative_path` 拼出绝对路径；
+3. 历史库缺失或没命中，再扫工作区的 `.dsh-im/inbound/**`（兼容 `01-1-<name>` 这种前缀；候选工作区来自进程目录和 `<DSH_HOME>/storages/workspace.json` 里注册过的路径）；
+4. 都找不到就**明说**：只有发给过机器人（或补了上面那个补丁）的附件才会被存下来，群里别人的原始文件拿不到 —— 打上面的补丁，或把文件直接和 `/birds` 发在同一条消息里。
 
-取到的文件仍然要过 `classifyFile()` 的**内容嗅探**才算数（名字后缀不可信）；结果里的「文件：…」显示的是那张图在 QQ 里的原始文件名（而不是本机的内容寻址 blob 名），末尾再加一行「（来自你引用的那条消息）」。
+还有一条独立的路：**聊天桥暂存的文件**。dsh-im 会把本条消息里的非图片附件（语音永远属于这类）自己下载到 `<会话工作区>/.dsh-im/inbound/<时间>-<随机>/<NN>-<名字>`，并在消息末尾追加一个 `<dsh_im_files>{"files":[{"name":…,"path":…}]}</dsh_im_files>` 清单（`path` 相对会话工作区）。`lib/im/manifest.mjs` 读这个清单，把相对路径解析成能打开的绝对路径 —— 所以「发一条语音 + /birds」本来就是通的；若清单里的路径在本机工作区找不到，回复会明说「收到了文件清单但文件不在本机工作区」，而不是含糊地说没有附件。
 
-安全边界：历史库只读打开（`node:sqlite` 的 `readOnly`），只按文件名精确匹配（inbound 里也只认 `-<name>` 后缀），不会顺着信封去读任意路径；群里别人的图不在库里，也就无从读到。补丁那条路也只下载平台 CDN 白名单里的地址，不碰任意域名。
+取到的文件仍然要过 `classifyFile()` 的**内容嗅探**才算数（名字后缀不可信）；结果里的「文件：…」显示的是那条消息在 QQ 里的原始文件名（而不是本机的内容寻址 blob 名），末尾再加一行「（来自你引用的那条消息）」。补丁补出来的无名字录音会带上按 MIME 猜的后缀（`.amr` / `.mp3` / `.m4a` …），所以扩展名这一层也能直接分类，兜底才靠魔数。
+
+安全边界：历史库只读打开（`node:sqlite` 的 `readOnly`），按文件名或平台消息 id 精确匹配（inbound 里也只认 `-<name>` 后缀），不会顺着信封去读任意路径；群里别人的附件不在库里，也就无从读到。清单里的相对路径也只在候选工作区根之内解析，越界的一律跳过。补丁那条路只下载平台 CDN 白名单里的地址，不碰任意域名。
 
 ### 可选：Telegram 桥
 
@@ -406,12 +416,13 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 ## 7. 自测
 
 ```bash
-node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序
-node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息与「引用图片」）、llm/stream 交付、生命周期
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序 / 引用附件回查 / dsh-im 补丁变换
+node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息、引用图片、引用语音、桥接暂存的录音）、llm/stream 交付、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
+node test/settings.mjs    # 设置卡：三条路由的守卫 / 打补丁 / 还原 + 浏览器半体的槽位与文案
 ```
 
-在 Node.js v22+ 上 `selftest` 140 项 + `hosttest` 72 项 + `imports` 20 项 + `settings` 67 项，共 299 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 155 项 + `hosttest` 77 项 + `imports` 21 项 + `settings` 67 项，共 320 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

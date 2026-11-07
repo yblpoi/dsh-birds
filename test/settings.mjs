@@ -24,17 +24,23 @@ function check(label, condition, detail) {
   }
 }
 
-// 与 scripts/patch-dsh-im.mjs 里的定位点保持一致；改那边时这里也要跟着改。
-const FUNCTION_ANCHOR = 'function rY(n,{fetchImpl:t=fetch}={}){';
-const RETURN_ANCHOR = 'let e=iY(n);return{content:aC(n),images:o,files:a,...e?{replyTo:e}:{}}';
+// 与 lib/dsh-im-patch.mjs 里当前那一组定位点保持一致；改那边时这里也要跟着改。
+// 用 5.9 – 5.10 的形状，这样设置页跑的也是真正在用的那条路径。
+const FUNCTION_ANCHOR = 'function LY(n,{fetchImpl:t=fetch}={}){';
+const RETURN_ANCHOR = 'let e=FY(n);return{content:hC(n),images:o,files:a,...e?{replyTo:e}:{}}';
 
 const MINI_BUNDLE = [
-  'function aC(n){return n?.ok===true?"ok":"no";}',
-  'function iY(n){return null;}',
-  'function hs(u,o){return Promise.resolve(new Uint8Array([1]));}',
-  'const kVe=["qpic.cn"];',
+  'function hC(n){return n?.ok===true?"ok":"no";}',
+  'function FY(n){return null;}',
+  'async function Bs(u,o){return new Uint8Array([1]);}',
+  'async function N5e(u,o){return new Uint8Array([2]);}',
+  'const D5e=Object.freeze(["qpic.cn"]);',
   FUNCTION_ANCHOR,
   'let o=[];let a=[];',
+  'for(const i of n?.attachments??[]){',
+  'if(i.pic){o.push({load:()=>{if(!i.url)throw new Error("QQ image attachment has no download URL");return Bs(i.url,{allowedHosts:D5e})}});continue;}',
+  'a.push({load:()=>{if(!i.url)throw new Error("QQ file attachment has no download URL");return N5e(i.url,{})}});',
+  '}',
   RETURN_ANCHOR + ';',
   '}',
 ].join('\n');

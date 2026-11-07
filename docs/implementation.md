@@ -11,7 +11,7 @@
 
 1. **定位了第一层扩展点**：DSH 内核自带人类命令注册表 `ctx.commands.register`（`@deepseek-ai/dsh-commands`），命令 handler 直接返回文本，**整个执行过程不启动 agent 回合**。
 2. **发现注册表有覆盖不到的入口**：注册表只管**客户端主动路由过来的行**。DSH Go 的 composer 在带附件时整行当普通 prompt 投给 `session/prompt`（`chat_screen.dart:486-493`），服务端 prompt 不做命令路由，于是 `/birds` + 照片仍会进 LLM。补一层回合边界钩子 `agent/pre-step` 兜底（见 §2.1）。
-3. **否掉了「让 dsh-im 帮忙路由命令」的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）；只有「引用图片」这一处另打了补丁（`scripts/patch-dsh-im.mjs`，见 §2.2），命令路由本身仍靠宿主钩子。
+3. **否掉了「让 dsh-im 帮忙路由命令」的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）；只有「引用附件」这一处另打了补丁（`scripts/patch-dsh-im.mjs`，见 §2.2），命令路由本身仍靠宿主钩子。
 4. **写出了完整插件** `dsh-birds`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
 
 ---
@@ -97,23 +97,39 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 
 **correlation 与清理**：暂存键是 `sessionId`，兑现前核对请求里的 user 消息 id 是否就是被接管的那条（不是就不动，留给真正的回合），兑现即删除；120 s 内没等到请求就作废。teardown 时整表清空。`test/host-mock.mjs` 用 `driveModelCall()` 驱动 `llm/stream` 钩子，钉住：桥消息→不写 command 事件、下次请求拿到本地文本、只消费一次、不串会话、不串回合。
 
-**「引用」的消息只剩文件名**：dsh-im 的 QQ 适配器取引用时只映射 `{kind, name}`（bundle 里的 `function iY(n)`：`attachments.map(r => { const s = ei(r?.filename); return { kind: Qne(r), ...s ? { name: s } : {} }; })`），平台 CDN 的 `url` 在进 Harness 之前就丢了；引用摘要 `zNe(n)` → `WNe(n)` 被序列化成 `<dsh_im_reply_to>…</dsh_im_reply_to>` 的 text part，被引用的图**也不会**出现在本条消息的 `images` 里（`Tv(n,{deferImages:true})` 算完文本就 `return s`）。所以 QQ 里「引用一张鸟图 + /birds」，插件拿到的只有一行 JSON 和一个文件名，回「没有收到图片或录音」。
+**「引用」的消息只剩元数据**：dsh-im 的 QQ 适配器取引用时只映射 `{kind, name}`（5.8.0 的 `function iY(n)`、5.10.0 的 `function FY(n)`，行为一致：`attachments.map(r => { const s = ei(r?.filename); return { kind: Qne(r), ...s ? { name: s } : {} }; })`），平台 CDN 的 `url` 在进 Harness 之前就丢了；引用摘要 `zNe(n)` → `WNe(n)`（5.10.0 的 `cRe/gRe`）被序列化成 `<dsh_im_reply_to>…</dsh_im_reply_to>` 的 text part，且 `gRe` 用 `let{files:t,...o}=n` 把 `files` 显式剥掉，被引用的图**也不会**出现在本条消息的 `images` 里（`Tv(n,{deferImages:true})` 算完文本就 `return s`）。所以 QQ 里「引用一张鸟图 + /birds」，插件拿到的只有一行 JSON 和一个文件名，回「没有收到图片或录音」。
 
-字节其实在本机：dsh-im 把群聊抄进 `~/.dsh/integrations/dsh-im/group-history.sqlite`，附件行是 `attachments(id, message_id, source_attachment_key, name, mime_type, size_bytes, relative_path, status, last_error)`，实体文件在同目录的 `group-files/<groupId>/<messageId>/<attachmentId>`；它收到的图也落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都以平台文件名索引，正好是信封里保留下来的那个字段，于是 `lib/im/quoted.mjs` 的 `resolveQuotedMedia()` 按名回查：① `<dsh_im_source>` 的 `channel` + `chatId` 对上 `groups(channel, platform_group_id)`，在库里找 `status='ready'`、`relative_path` 非空且文件仍在的同名附件（`order by m.sent_at desc limit 3`，认最新的）；② 落空就扫 `.dsh-im/inbound/**`，接受 `name` 或 `-<name>` 后缀；③ 都没有就返回 `unresolved`，文案明说「只有发给过机器人的图片才会被存下来」。取到的文件仍要过 `recognizeFile` 的 `classifyFile()` 内容嗅探。
+**语音比图片更糟**：QQ 的语音消息本来就没有 `filename`，引用之后信封里只剩 `{"kind":"audio"}`（`FY` 里 `...s?{name:s}:{}` 不成立，`asr_refer_text` 多半也为空）。旧的 `quotedMediaNames()` 遇到没有 name 的附件直接 `continue`，于是这种引用连 `unresolved` 都进不去，最终落到「没有收到图片或录音」。这是本 bug 的第一处成因。
+
+**非图片附件根本不走 parts**：`tP()` 只处理 `images`，非图片一律进 `files`，由 dsh-im 自己通过 `#G` → Harness file ingress（`aD()`）下载到 `<会话工作区>/.dsh-im/inbound/<YYYYMMDD-HHMMSS->/<NN>-<safeName>`，再以 `<dsh_im_files>{"files":[{name,path}]}</dsh_im_files>` 的形式追加成 text part（`oD()`）。`path` 相对会话工作区，而会话工作区**不在** `agent/pre-step` 的 payload 里（只有 `agent/messages/signal/step/modelSelection`）。这是第二处成因：插件只读 `image`/`file` 类型的 part，导致「发语音 + /birds」也走过一次「没有收到」的错误分支（取决于桥有没有生成清单）。
+
+字节其实在本机：dsh-im 把群聊抄进 `~/.dsh/integrations/dsh-im/group-history.sqlite`，附件行是 `attachments(id, message_id, source_attachment_key, name, mime_type, size_bytes, relative_path, status, last_error)`，实体文件在同目录的 `group-files/<groupId>/<messageId>/<attachmentId>`；它收到的图也落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。于是 `lib/im/quoted.mjs` 的 `resolveQuotedMedia()` 分三条路查：
+
+1. **按平台消息 id（无名字的语音唯一的路）**：信封里的 `messageId` 对上 `messages.platform_message_id`，取该消息所有 `status='ready'` 的附件（`order by a.rowid asc`）。不看名字，按引用条目声明的 `kind` 与附件行的 `mime_type` 对齐（`kindOfMimeType()`：`audio/` → `audio`，`image/` → `image` …）。一条消息可能有多个附件，所以只取同类里第一条，剩下的仍按名走下面的路。
+2. **按平台文件名**（图片那条老路，也是信封里通常唯一保留下来的字段）：`<dsh_im_source>` 的 `channel` + `chatId` 对上 `groups(channel, platform_group_id)`，在库里找同名 `status='ready'`、`relative_path` 非空且文件仍在的附件（`order by m.sent_at desc limit 3`，认最新的）。
+3. **扫 inbound 暂存**：`<工作区>/.dsh-im/inbound/**`，接受 `name` 或 `-<name>` 后缀。工作区候选 = `cwd`（payload 里没有，只能取进程目录）+ `<DSH_HOME>/storages/workspace.json` 里 `tables.workspaces[*].path` 注册过的所有路径 + `<DSH_HOME>/workspace`。
+
+都没有就返回 `unresolved`，文案明说「只有发给过机器人的图片和录音才会被存下来」。取到的文件仍要过 `recognizeFile` 的 `classifyFile()` 内容嗅探。
+
+**桥接暂存的文件（第三条完全独立的路）**：`<dsh_im_files>` 清单由新的 `lib/im/manifest.mjs` 解析 —— `parseFileManifest()` 收 `{name,path}`，`workspaceRoots()` 给候选根（同上），`locate()` 逐个根 resolve 并用 `path.relative` 拒绝越界（`''` / `..` / 绝对路径都跳过），`resolveBridgeFiles()` 返回 `{files,unresolved}`，按绝对路径去重。这样「发一条语音 + /birds」（没有引用）也能识别，且清单路径找不到时错误文案是「收到了文件清单，但这些文件在本机工作区里找不到」而不是含糊的没有附件。
 
 安全边界：`DatabaseSync(path, { readOnly: true })` 只读打开（`node:sqlite` 在 Node 22+ 内置，动态 import 失败就跳过这一步只走 inbound），查询参数只有文件名与群标识，路径由库里的 `relative_path` 拼出且 `stat` 校验 `isFile`、`size > 0`；`size_bytes` 与磁盘不符只 warn 并以磁盘字节为准。不会顺着信封读任意路径 —— 群里别人的原图本来就不在库里。
 
 **url 其实在推送里，是 dsh-im 丢的（5.8.0 与 5.10.0 实测）**：QQ 推送的 `msg_elements[0].attachments[i]` 带 `content_type` / `url` / `filename`，`@tencent-connect/qqbot-nodejs` 的 `QuotedAttachment` 类型就是照这个写的（`src/middleware/quote-ref.ts`），dsh-im 的 `qqReplyReference()`（`src/channels/qq/qq-bridge.mjs:190`）也读同一个对象，只是 `map` 成 `{kind, name}` 时把 `url` 扔了；5.10.0 的 `FY` 与 5.8.0 的 `iY` 行为一致，升级不解决。所以「按名回查」只是无补丁时的降级路径。
 
-**补 dsh-im 一处洞：`scripts/patch-dsh-im.mjs`**。脚本改的是 dsh-im 构建产物里 QQ inbound 构造器（`function rY(n,{fetchImpl:t=fetch}={}){…}`，紧跟 `let e=iY(n);return{content:aC(n),images:o,files:a,…}`）：把引用附件里能用的图片同样 push 进本条消息的 `images`。这样引用图走的就是**普通图片那条 Harness 附件通道**（dsh-im 自己的 `hs()` 下载 + 平台 CDN 白名单 `kVe`，成功后由 `inbound-file` 暂存并 admit 成 image part），插件与模型都能看到；失败也只是这张图当没引，不影响其他附件。
+**补 dsh-im 一处洞：`scripts/patch-dsh-im.mjs`**。脚本改的是 dsh-im 构建产物里 QQ inbound 构造器（5.9–5.10：`function LY(n,{fetchImpl:t=fetch}={}){…}`，返回 `let e=FY(n);return{content:hC(n),images:o,files:a,…}`；5.5–5.8：`function rY(…)` / `let e=iY(n);return{content:aC(n),…}`）：在 `return` 之前追加一句，把引用附件里能用的**图片** push 进本条消息的 `images`、**语音和其他文件** push 进 `files`。两条都是 dsh-im 自己的通道（图片下载器 + 平台 CDN 白名单；文件下载器），所以下游由它自己 `#G` → `aD()` 落盘并生成 `<dsh_im_files>`，插件与模型都能看到；失败也只是这一条当没引，不影响其他附件。
+
+生成的那句是 `for(const __q of __qbQuotedMedia(n,t)){if(__q.kind==="image")o.push(__q.value);else a.push(__q.value);}` —— helper 返回 `{kind, value}` 而不是直接 push，因为两个目标数组不一样。helper 里没有文件名的附件用局部计数器 `nf` 编号成 `quoted-file-1.amr`（按 MIME 补后缀，`EXT` 映射表），**不能**用 `out.length`（图片也会占位，序号会跳）。
 
 约束与风险，全部写进了脚本头和 README：
 
-- 只搬运**图片**（`content_type` 以 `image/` 开头，或文件名是图片后缀），要求 `https` 地址，并按 `url` 去重（同一条消息已经带了的附件不重复搬）；语音/文件仍按元数据处理。
-- 按 5.8.0 的压缩产物写死两处锚点，**各命中一次才动手**；认不出就抛 `UnsupportedBundleError` 并拒绝修改，宁可不改。
+- 图片要求 `https` 地址（`//` 补成 `https:`），按 `url` 去重（同一条消息已经带了的附件不重复搬）；非图片走 `files`，只在找不文件下载器时跳过（老到没有文件通道的版本）。
+- 按已知版本的压缩产物定位：`ANCHOR_SETS` 两组（5.9–5.10 / 5.5–5.8），每组的函数锚点与返回锚点**各命中一次才动手**；都不中时抛 `UnsupportedBundleError`，消息里列出每组各命中几次，方便对齐新版本 —— 宁可不改。
+- **下载器名不写死**：压缩产物的短名逐版本漂移（5.8.0 的图片下载器叫 `hs`、白名单叫 `kVe`，5.10.0 里 `hs` 变成了不相干的对象断言、`kVe` 变成了飞书事件名）。所以补丁从产物里探：拿 LY 函数体里 `"QQ image attachment has no download URL"` / `"QQ file attachment has no download URL"` 后面紧跟的 `return X(` 取名，再从 `allowedHosts:\s*Y` 取白名单名并用 `declaresArray()` 校验它真是个数组字面量，最后用 `declaresFunction()` 确认两个名字各只声明一次；任一步不成立就抛 `UnsupportedBundleError`（消息里写「…但认不出它的下载器（图片 X、文件 Y）」）—— 宁可拒绝，也不生成一份必然报错的补丁。5.5–5.8 没有这两句提示串，回退到校对过的 `hs`/`kVe`/`N5e`。
 - 先备份成 `lib/index.js.orig-xxxxxxxx`（带内容摘要，重装后再打不会覆盖备份），`--restore=` 可还原；重复执行是幂等的。
-- 改的是**第三方插件的构建产物**：dsh-im 升级或 profile 重装会覆盖，需要重跑脚本；因此它只作为「引用图」的补丁，不承担命令路由。
-- `test/selftest.mjs` 用一份含两处锚点的小样本验证：改写生效、幂等、认不出时抛错；再用 `new Function` 把生成的 `__qbQuotedMedia` 装进桩 `hs`/`kVe` 跑真实入参 —— 引用图变成附件、`load()` 走平台白名单、重复/无 url/非图片/非白名单域名都不搬。
+- 改的是**第三方插件的构建产物**：dsh-im 升级或 profile 重装会覆盖，需要重跑脚本；因此它只作为「引用附件」的补丁，不承担命令路由。
+- `test/selftest.mjs` 用一份含两处锚点的小样本（5.10.0 形状：`FY`/`hC`/`Bs`/`N5e`/`D5e`/`LY`）验证：改写生效、幂等、认不出时抛错、下载器找不到时也抛错、把 `Bs`/`D5e` 整体改名后补丁能跟着改名走；再用 `new Function('Bs','N5e','D5e', …)` 把生成的 `__qbQuotedMedia` 装进桩函数跑真实入参 —— 引用图变成 image、`load()` 走平台白名单、语音进 file 并走文件下载器、无 filename 的录音补出 `.amr`/编号不撞、重复/无 url/非白名单域名都不搬。
+- `test/settings.mjs` 的 `MINI_BUNDLE` 同步换成了 5.10.0 形状，所以设置页那三条路由跑的是真正在用的那一组锚点。
 
 **设置里的入口：`client.js` + `lib/im-patch-api.mjs`（1.0.0 起）**。变换本体在 `lib/dsh-im-patch.mjs`，`scripts/patch-dsh-im.mjs` 只是它的终端外壳——运行时（宿主半体）不能 import `scripts/`，有的装机方式只搬 `lib/`，那样插件会整块 import 失败（1.0.0 首次真机部署踩到：`ERR_MODULE_NOT_FOUND .../dsh-birds/scripts/patch-dsh-im.mjs`，diagnostics 里多一条 did not activate）。宿主 0.2.x 的插件管理页**只提供布局**，卡片本身要插件自带浏览器半体：`package.json` 里声明 `dsh.manifestVersion: 1`、`dsh.client: { platform: 'web', inject: [] }` 和 `exports['./client']`（只声明 client 却没有这个 export，`dsh-client-modules` 会直接抛错），`client.js` 用 `window.__ModuleLoader__.load({ id: 'dsh-birds', factory })` 包成单文件，`exports.inject = ['slots']`，在 `apply` 里注册三处槽：
 
@@ -251,10 +267,13 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 140 + 72 + 20 + 67 = 299 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 155 + 77 + 21 + 67 = 320 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
-| dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `hs`/`kVe` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；引用图变成附件并走平台白名单，重复/无 url/非图片/非白名单域名不搬 |
+| 引用语音回查 | 同上，但附件行是 `audio/amr`、引用条目只有 `{kind:'audio'}`（无 name），靠 `messageId` 查 | 仍能从历史库取回实体文件并嗅探为 audio；机器人没收到过的那条 → `unresolved`；无名的普通 file 不去瞎猜 |
+| dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `Bs`/`N5e`/`D5e` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；下载器被改名后补丁跟着改名、找不到下载器时拒绝打补丁；引用图变成 image 并走平台白名单，引用语音变成 file 并走文件通道，无 filename 的录音补出可用后缀且编号不撞，重复/无 url/非白名单域名不搬 |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
+| 桥接暂存的录音 | host-mock 在会话工作区造真实 `.dsh-im/inbound/<时间>/01-voice.amr`，清单只给相对路径 | 被接管、答案里是识别结果（不是「没有收到图片或录音」）；文件真不在时答「找不到」而不是没有附件 |
+| 引用语音端到端 | host-mock 用临时 DSH_HOME + 历史库，消息走 QQ 形态但附件只有 `{kind:'audio'}` | 被接管，答案不是「没有存到本机」 |
 | 中英对照名表 | selftest 校验名表行数、抽样中文名、指纹不符时停用 | 图片 9826/10480、声音 9794/11560 |
 | 设置卡路由 | settings 测试：假 dsh-im 安装目录 + 假 req/res 驱动三条路由 | 状态 200、打补丁 changed=1 且写入成功、二次 patch 幂等、还原回原文、非回环/跨站/方法不符/缺同源证据都拒绝、认不出的产物不改 |
 | 设置卡浏览器半体 | settings 测试：桩 `window.__ModuleLoader__` + 桩 `require('react')` 加载 `client.js` | 注册 `plugins.bundle.config`（key `dsh-birds`）、`plugins.row.config`（两个行 id）、旧 `settings.plugin.item`；summary 返回 null；各种状态文案与按钮可用性正确 |
