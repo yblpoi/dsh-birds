@@ -78,7 +78,9 @@ check('module exports a name', mod.name === 'dsh-birds', mod.name);
 check('module declares the commands injection', Array.isArray(mod.inject) && mod.inject.includes('commands'), JSON.stringify(mod.inject));
 check('module exports apply()', typeof mod.apply === 'function');
 
-mod.apply(ctx, { modelsDir, topK: 3 });
+// autoDownload is off here on purpose: this test must never touch the network.
+// The background download itself is covered by CLI/provision tests instead.
+mod.apply(ctx, { modelsDir, topK: 3, autoDownload: false });
 
 check('two commands registered', registered.length === 2, registered.length);
 const names = registered.map((d) => d.name);
@@ -102,6 +104,7 @@ check('birds error text explains usage', typeof noArgs.text === 'string' && noAr
 const badPath = await birdId.handler({ commandId: 'c2', agent: { session: {} }, rawInput: '/definitely/not/here.jpg', attachments: [], signal });
 check('birds with a bad path stays an error result', badPath.kind === 'error', badPath.kind);
 
+
 const status = registered.find((d) => d.name === 'birdstatus');
 const statusResult = await status.handler({ commandId: 'c3', agent: { session: {} }, rawInput: '', attachments: [], signal });
 check('birdstatus returns success', statusResult.kind === 'success', statusResult.kind);
@@ -110,6 +113,10 @@ check('birdstatus lists acoustic model', statusResult.text.includes('audioModel'
 check('birdstatus lists geomodel', statusResult.text.includes('geoModel'), statusResult.text);
 check('birdstatus reports platform', statusResult.text.includes(process.platform), statusResult.text);
 check('birdstatus marks missing models', statusResult.text.includes('✗'), statusResult.text);
+check('birdstatus names the ffmpeg the plugin brings', statusResult.text.includes('ffmpeg'), statusResult.text);
+check('birdstatus no longer asks to run a script by hand', !statusResult.text.includes('缺失模型文件'), statusResult.text);
+check('birdstatus says the plugin installs itself', statusResult.text.includes('自动下载'), statusResult.text);
+check('birdstatus explains that auto download is off', statusResult.text.includes('自动下载已关闭'), statusResult.text);
 
 // --- attachment routing: an image host path is picked up ---
 const fakeImage = path.join(modelsDir, 'fake.jpg');
@@ -123,6 +130,11 @@ const withAttachment = await birdId.handler({
 });
 // sharp is optional here, and the model is missing anyway: either way the call
 // must settle as an error result rather than throw.
+// A real JPEG reaches the handler before the models are on disk: the reply has
+// to describe the automatic download rather than fail on a missing file.
+const notReady = await birdId.handler({ commandId: 'c5', agent: { session: {} }, rawInput: fakeImage, attachments: [], signal });
+check('birds with a photo and no models explains the download', notReady.kind === 'error' && notReady.text.includes('模型'), notReady.text);
+
 check('birds with an attachment settles as a result', typeof withAttachment.kind === 'string', JSON.stringify(withAttachment).slice(0, 120));
 check('birds with an attachment reports a readable failure', typeof withAttachment.text === 'string' && withAttachment.text.length > 0, withAttachment.text);
 

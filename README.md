@@ -120,17 +120,35 @@ npm install --force
 
 或者把包下载下来手工解包到 `node_modules/onnxruntime-node`。
 
-### 3.3 下载模型
+### 3.3 模型与 ffmpeg：装好插件就已经装好
+
+**不需要手动下载模型，也不需要 `apt install ffmpeg`。** 插件加载时会在后台自动完成这两件事：
+
+1. 把 6 个模型文件下到 `modelsDir`（默认 `~/.dsh/models/bird`）；
+2. 把当前平台（linux/darwin/win32 × arm64/x64）的静态 ffmpeg 二进制下到 `<modelsDir>/bin/ffmpeg`——手机上的 PRoot 环境因此不需要包管理器。
+
+如果宿主机的 `PATH` 里本来就有可用的 `ffmpeg`，插件会直接借它，不再下这 50 MB 的自带副本（`/birdstatus` 会写明用的是哪一份）。自带副本始终优先，所以装过系统 ffmpeg 也不会改变解码行为。
+
+进度随时看 `/birdstatus`：
+
+```
+下载任务：后台进行中 3/7 个文件，正在下 BirdNET+_V3.0-preview3.1_Global_11K_FP16_pruned.onnx（88.4 / 309.6 MB，28%）
+```
+
+第一次 `/birds` 落在下载没完成的时候，会直接回一句「正在后台下载 x/y 个文件」，不会报模型缺失，也不会去调大模型。下载完成后重发即可；中断过的文件按 `.part` 续传，落盘前会同时校验字节数与 SHA-256。
+
+> 为什么不用 npm 的 `postinstall`：npm 会把带安装脚本的 git 依赖判定为需要人工放行（`EALLOWSCRIPTS`），手机 profile 里没人能点那个确认，安装会直接失败。所以自动安装放在插件加载时，安装命令保持纯粹。
+
+想手动重跑（可选，等价入口）：`dsh-birds-models`（profile 的 `node_modules/.bin/` 里），或
 
 ```bash
 cd ~/.dsh/profiles/desktop/node_modules/dsh-birds
 node scripts/download-models.mjs
-# 或指定目录：node scripts/download-models.mjs --dir=/data/models/bird
+# 只补 ffmpeg：node scripts/download-models.mjs --ffmpeg
+# 换个存放位置：node scripts/download-models.mjs --dir=/data/models/bird
 ```
 
-安装时还会提供 `dsh-birds-models` 命令（位于 profile 的 `node_modules/.bin/`），效果相同。
-
-脚本会拉到：
+下载内容：
 
 | 文件 | 大小 | 来源 |
 | --- | --- | --- |
@@ -140,6 +158,7 @@ node scripts/download-models.mjs
 | `BirdNET+_V3.0-preview3.1_Global_11K_Labels.csv` | 809,172 B | 同上 |
 | `BirdNET+_Geomodel_V3.0.4_Global_14K_FP16.onnx` | 7,885,053 B | `https://github.com/birdnet-team/geomodel/releases/download/v3.0.4/…` |
 | `BirdNET+_Geomodel_V3.0.4_Global_14K_Labels.txt` | 671,823 B | 同上 |
+| `bin/ffmpeg`（静态二进制） | 45–81 MB，按平台 | `ffmpeg-static` b6.0：`cdn.npmmirror.com` → GitHub Releases |
 
 > **为什么要用 hf-mirror**：`huggingface.co`、`cdn.jsdelivr.net`、`raw.githubusercontent.com` 在部分网络环境下直连超时，而 `hf-mirror.com`、`zenodo.org`、`github.com` 通常可用。Zenodo 与 GitHub Releases 都支持 Range 请求，所以脚本能断点续传，手机上一次下不完可以再跑一次。
 
@@ -265,17 +284,14 @@ DSH Go 内置 PRoot Ubuntu + Node.js，插件跑在那个环境里。步骤：
 uname -m            # 期望 aarch64
 node -v             # 期望 v22.19 以上
 
-# 2) 装 ffmpeg（mp3/m4a/ogg 解码与图片兜底解码都要它）
-apt update && apt install -y ffmpeg
-
-# 3) 装插件（从 GitHub 仓库装，不需要 npm 账号）
+# 2) 装插件（从 GitHub 仓库装，不需要 npm 账号）
+#    不用先 apt install ffmpeg：插件加载时会下自带的静态二进制
 #    DSH Go 的 profile 目录名是 web（桌面端通常是 desktop），先 ls ~/.dsh/profiles 确认
 cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 
-# 4) 下模型（约 250 MB，可断点续传）
-cd ~/.dsh/profiles/web/node_modules/dsh-birds && node scripts/download-models.mjs
-
-# 5) 重启 DSH，然后 /birdstatus 检查
+# 3) 重启 DSH：模型（约 250 MB）和静态 ffmpeg（约 50 MB）会自己下好
+#    /birdstatus 里能看到进度，不需要 apt，也不需要跑脚本
+# 4) /birdstatus 检查，看到 6 个 ✓ 和 ffmpeg 一行就绪即可
 ```
 
 ### 真机上的性能与内存
@@ -297,8 +313,8 @@ cd ~/.dsh/profiles/web/node_modules/dsh-birds && node scripts/download-models.mj
 
 1. **`dlopen libonnxruntime.so.1` 失败**：PRoot 里的 glibc 版本太老。DSH Go 自带的 Ubuntu 一般没问题；万一不行，用 `onnxruntime-node@1.26.0`（同版本线更老、依赖更少）或退回 wasm 方案。
 2. **`sharp` 装不上**：它只是可选依赖，插件会自动回退到 `ffmpeg` 解码图片。两条路都不通时才会报错，报错文案里写清了怎么修。
-3. **下载中断**：脚本保留 `.part`，重跑即续传。
-4. **`ffmpeg` 缺失 + 非 WAV 音频**：报错会直接告诉你去 `apt install -y ffmpeg`。
+3. **下载中断**：保留 `.part`，下次加载插件或重发 `/birds` 会自动续传；全线路不通时用 `node scripts/download-models.mjs --check` 看是哪一层网络拦了。
+4. **`ffmpeg` 没就绪 + 非 WAV 音频**：插件自带的那份还在下载（`/birdstatus` 会显示进度）。下载失败时可以先发 WAV，或自己装一个系统 ffmpeg 顶一下（`config.ffmpegPath` / `$DSH_BIRDS_FFMPEG` 也能指定现成的二进制）。
 5. **模型下完但 `/birds` 仍说没模型**：模型目录是按运行插件的那个用户的 `$HOME` 解析的。用 root 手动跑过下载脚本，模型就落在 `/root/.dsh/models/bird`；如果 DSH 以别的用户运行，需要 `chown` 或显式传 `DSH_BIRDS_MODELS`/`--dir`。
 6. **在 proot 里手动跑命令**：从 Android 侧直接执行 `libproot.so` 会因为找不到 `libtalloc.so` 和临时目录而失败，必须先导出 `LD_LIBRARY_PATH`、`PROOT_LOADER`、`PROOT_L2S_DIR`、`PROOT_TMP_DIR`（这些值可以在 `/proc/<proot pid>/environ` 里看到）。用 Magisk 的 `su` 可以这样进：`su -c '<rootfs 里的 bash> -lc "cd /root && node ..."'`。
 
@@ -307,12 +323,12 @@ cd ~/.dsh/profiles/web/node_modules/dsh-birds && node scripts/download-models.mj
 ## 7. 自测
 
 ```bash
-node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版 / 地理先验门控
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序
 node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 62 项 + `hosttest` 45 项 + `imports` 14 项，共 121 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 100 项 + `hosttest` 50 项 + `imports` 16 项，共 166 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

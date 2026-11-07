@@ -7,6 +7,18 @@ import { planChunks, sliceChunk } from '../lib/audio/chunk.mjs';
 import { isoWeek, kindOf, sniffKind, classifyFile, isAttachmentBlob } from '../lib/recognize.mjs';
 import { formatImageResult, formatAudioResult, formatStatus } from '../lib/format.mjs';
 import { planChunks as pc } from '../lib/audio/chunk.mjs';
+import {
+  USER_AGENT,
+  FFMPEG_BUILD,
+  modelTargets,
+  ffmpegTargetFor,
+  ffmpegBinaryName,
+  ffmpegInstallPath,
+  Provisioner,
+  mb,
+} from '../lib/provision.mjs';
+import { configureFfmpeg, describeFfmpeg, localFfmpegPath, provisionedFfmpegPath } from '../lib/ffmpeg.mjs';
+import { formatProvisioning } from '../lib/format.mjs';
 
 let failures = 0;
 function check(label, condition, detail) {
@@ -192,6 +204,101 @@ check('geo marks the filter as applied', filtered.applied === true, String(filte
 
 const unapplied = filterByAllowedSpecies([{ scientific: 'Pica_pica', score: 0.7 }], null);
 check('geo passes detections through when there is no gate', unapplied.applied === false && unapplied.kept.length === 1, JSON.stringify(unapplied));
+
+
+// ---- Provisioning: the plugin installs itself (models + bundled ffmpeg) ----
+// A fresh install used to need "apt install ffmpeg" plus a manual
+// "node scripts/download-models.mjs". Both are the plugin's own job now, and
+// the tables below are the contract every download is verified against.
+const models = modelTargets({});
+check('provisioning knows six model files', models.length === 6, String(models.length));
+check('every model pins a byte count and a sha256', models.every((target) => target.bytes > 0 && /^[0-9a-f]{64}$/.test(target.sha256)), JSON.stringify(models.map((t) => t.file)));
+check('every model has an https route', models.every((target) => target.urls.length >= 1 && target.urls.every((url) => url.startsWith('https://'))), JSON.stringify(models.map((target) => target.urls.length)));
+check('the mirrored models keep a second route', models.filter((target) => target.key !== 'geoModel' && target.key !== 'geoLabels').every((target) => target.urls.length >= 2), JSON.stringify(models.map((target) => target.key + ':' + target.urls.length)));
+check('the model table covers images, audio and geo', ['imageModel', 'audioModel', 'geoModel'].every((key) => models.some((target) => target.key === key)), JSON.stringify(models.map((t) => t.key)));
+const mirrored = modelTargets({ hfMirror: 'https://mirror.example' });
+check('an hf mirror is spliced into the huggingface routes', mirrored.some((target) => target.urls.some((url) => url.startsWith('https://mirror.example/'))), String(mirrored.length));
+check('the user agent is not bare node', USER_AGENT.startsWith('dsh-birds/'), USER_AGENT);
+check('ffmpeg build is pinned', FFMPEG_BUILD === 'b6.0', FFMPEG_BUILD);
+
+const linuxArm = ffmpegTargetFor('linux', 'arm64');
+const linuxX64 = ffmpegTargetFor('linux', 'x64');
+const darwinArm = ffmpegTargetFor('darwin', 'arm64');
+const winX64 = ffmpegTargetFor('win32', 'x64');
+const unsupported = ffmpegTargetFor('linux', 'ia32');
+check('ffmpeg has a linux arm64 build', linuxArm.bytes === 50_015_760 && linuxArm.asset === 'ffmpeg-linux-arm64', JSON.stringify(linuxArm));
+check('ffmpeg has a linux x64 build', linuxX64.bytes === 78_683_840, JSON.stringify(linuxX64));
+check('ffmpeg has a darwin arm64 build', darwinArm.bytes === 45_568_216, JSON.stringify(darwinArm));
+check('ffmpeg has a win32 x64 build', winX64.bytes === 81_114_624, JSON.stringify(winX64));
+check('ffmpeg names the platform binary', ffmpegBinaryName('win32') === 'ffmpeg.exe' && ffmpegBinaryName('linux') === 'ffmpeg', ffmpegBinaryName('win32'));
+check('an unshipped platform is reported as unsupported', unsupported.unsupported === true, JSON.stringify(unsupported));
+check('unsupported platforms still yield no fake size', unsupported.bytes === 0, String(unsupported.bytes));
+check('ffmpeg installs under the models directory', ffmpegInstallPath('/m', 'linux') === '/m/bin/ffmpeg' && ffmpegInstallPath('/m', 'win32') === '/m/bin/ffmpeg.exe', ffmpegInstallPath('/m', 'linux'));
+check('ffmpeg links come from two hosts', linuxArm.urls.length === 2 && new Set(linuxArm.urls.map((url) => new URL(url).host)).size === 2, JSON.stringify(linuxArm.urls));
+
+// plan() is the readiness gate /birds and /birdstatus both consult.
+const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-provision-'));
+const empty = new Provisioner({ modelsDir: emptyDir, logger: { info() {}, warn() {} } });
+const emptyPlan = empty.plan();
+check('an empty models dir plans six downloads', emptyPlan.modelsMissing.length === 6, String(emptyPlan.modelsMissing.length));
+check('an empty models dir also plans ffmpeg', emptyPlan.ffmpegMissing === true, String(emptyPlan.ffmpegMissing));
+check('an empty models dir is not ready', emptyPlan.ready === false, String(emptyPlan.ready));
+check('the plan totals the missing bytes', emptyPlan.missingBytes === models.reduce((sum, target) => sum + target.bytes, 0) + ffmpegTargetFor().bytes, mb(emptyPlan.missingBytes));
+
+// A file of the wrong size is still "missing": a truncated download must never
+// be mistaken for an installed one.
+for (const target of models) {
+  const file = path.join(emptyDir, target.file);
+  fs.writeFileSync(file, Buffer.alloc(0));
+  fs.truncateSync(file, target.bytes - 1);
+}
+fs.mkdirSync(path.join(emptyDir, 'bin'), { recursive: true });
+fs.writeFileSync(ffmpegInstallPath(emptyDir), Buffer.alloc(0));
+const shortPlan = empty.plan();
+check('a truncated model is still missing', shortPlan.modelsMissing.length === 6, String(shortPlan.modelsMissing.length));
+check('an empty ffmpeg placeholder is not ready', shortPlan.ffmpegMissing === true, String(shortPlan.ffmpegMissing));
+for (const target of models) fs.truncateSync(path.join(emptyDir, target.file), target.bytes);
+fs.writeFileSync(ffmpegInstallPath(emptyDir), Buffer.from('#!/bin/sh'));
+const readyPlan = empty.plan();
+check('exact sizes and an ffmpeg make the plan ready', readyPlan.ready === true, JSON.stringify({ missing: readyPlan.modelsMissing.length, ffmpeg: readyPlan.ffmpegMissing }));
+check('a ready plan has nothing left to fetch', readyPlan.missingBytes === 0, String(readyPlan.missingBytes));
+
+const idleState = empty.status();
+check('an unran provisioner reports no progress', idleState.running === false && idleState.totalFiles === 0, String(idleState.running));
+check('status snapshots hand out copies', Array.isArray(idleState.results) && idleState.results.length === 0, '');
+fs.rmSync(emptyDir, { recursive: true, force: true });
+
+// ---- ffmpeg lookup order: config, env, provisioned copy, then PATH ----
+const ffmpegDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-ffmpeg-'));
+configureFfmpeg({ modelsDir: ffmpegDir, explicitPath: undefined, logger: { info() {}, warn() {} } });
+check('a bare models dir has no local ffmpeg', localFfmpegPath() === undefined, JSON.stringify(localFfmpegPath()));
+check('the provisioned path lives under models/bin', provisionedFfmpegPath() === path.join(ffmpegDir, 'bin', ffmpegBinaryName()), provisionedFfmpegPath());
+const missingInfo = describeFfmpeg();
+check('a missing ffmpeg says where it will land', missingInfo.startsWith('未就绪') && missingInfo.includes(ffmpegDir), missingInfo);
+const provisioned = provisionedFfmpegPath();
+fs.mkdirSync(path.dirname(provisioned), { recursive: true });
+fs.writeFileSync(provisioned, Buffer.from('#!/bin/sh'));
+fs.chmodSync(provisioned, 0o755);
+const found = localFfmpegPath();
+check('the provisioned copy is picked up', found?.path === provisioned && found.source === 'provisioned', JSON.stringify(found));
+check('describe() credits the plugin for its own binary', describeFfmpeg().startsWith('插件自带'), describeFfmpeg());
+const explicit = path.join(ffmpegDir, 'hand-picked');
+fs.writeFileSync(explicit, Buffer.from('#!/bin/sh'));
+configureFfmpeg({ explicitPath: explicit });
+check('config.ffmpegPath wins over the provisioned copy', localFfmpegPath()?.source === 'config', JSON.stringify(localFfmpegPath()));
+check('describe() names an explicit path as configured', describeFfmpeg().startsWith('配置指定'), describeFfmpeg());
+configureFfmpeg({ explicitPath: undefined });
+fs.rmSync(ffmpegDir, { recursive: true, force: true });
+
+// ---- /birdstatus wording for the download line ----
+const runningLine = formatProvisioning({ running: true, doneFiles: 2, totalFiles: 7, doneBytes: 100 * 1048576, totalBytes: 400 * 1048576, current: 'audioModel', autoDownload: true, pendingFiles: 5 });
+check('a running download reports files and megabytes', runningLine.includes('2/7') && runningLine.includes('audioModel') && runningLine.includes('25%'), runningLine);
+const failedLine = formatProvisioning({ running: false, doneFiles: 3, totalFiles: 7, error: 'HTTP 403', autoDownload: true, pendingFiles: 4 });
+check('a failed download keeps the reason', failedLine.includes('403') && failedLine.includes('续传'), failedLine);
+const pendingLine = formatProvisioning({ running: false, totalFiles: 0, doneFiles: 0, autoDownload: false, pendingFiles: 7 });
+check('a never-started download counts what is pending', pendingLine.includes('7') && pendingLine.includes('自动下载已关闭'), pendingLine);
+const localLine = formatProvisioning({ running: false, totalFiles: 0, doneFiles: 0, autoDownload: true, pendingFiles: 0 });
+check('an installed plugin says nothing is left', localLine.includes('无需下载'), localLine);
 
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);

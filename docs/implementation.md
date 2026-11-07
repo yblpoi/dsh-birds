@@ -148,10 +148,9 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 uname -m                       # 应为 aarch64
 node -v                        # 应为 v22.19+
 
-# ② 装运行时依赖
-apt update && apt install -y ffmpeg
-
-# ③ 装插件（从 GitHub 仓库装，不需要 npm 账号）
+# ② 装插件（从 GitHub 仓库装，不需要 npm 账号）
+#    运行时依赖只有 onnxruntime-node，随 npm install 一起装好；
+#    ffmpeg 不再需要 apt —— 插件加载时自己下静态二进制
 cd ~/.dsh/profiles/web                   # DSH Go 的 profile 叫 web；桌面端通常是 desktop
 npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-birds
 # 在 cordis.patch.yml 顶层追加：
@@ -160,10 +159,11 @@ npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-bird
 #         name: dsh-birds
 #         config: { modelsDir: ~/.dsh/models/bird }
 
-# ④ 下模型（约 250 MB，断点续传）
-cd node_modules/dsh-birds && node scripts/download-models.mjs
+# ③ 重启 DSH：模型（约 250 MB）与静态 ffmpeg（约 50 MB）由插件自动下载，
+#    进度看 /birdstatus；不需要手动跑脚本
+#    宿主机 PATH 里已有 ffmpeg 时只补模型，不再下那 50 MB 自带副本
 
-# ⑤ 重启 DSH，在会话里敲（两个命令都应出现在命令面板里）
+# ④ 在会话里敲（两个命令都应出现在命令面板里）
 /birdstatus          # 六个模型文件与推理引擎状态
 /birds               # 附带图片或录音，本机识别
 ```

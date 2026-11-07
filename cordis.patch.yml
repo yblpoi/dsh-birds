@@ -3,8 +3,14 @@
     - id: dsh-birds
       name: dsh-birds
       config:
-        # 模型目录；~ 会展开到 $HOME
+        # 模型目录；~ 会展开到 $HOME。模型和自带 ffmpeg 都下到这里。
         modelsDir: ~/.dsh/models/bird
+        # 插件加载时自动下载模型与 ffmpeg（默认 true）。关掉就用 /birdstatus 看缺失项。
+        autoDownload: true
+        # 可选：Hugging Face 镜像，默认 https://hf-mirror.com
+        # hfMirror: https://hf-mirror.com
+        # 可选：手动指定现成的 ffmpeg，指着它就不会再下自带的
+        # ffmpegPath: /usr/bin/ffmpeg
         # 输出前 N 个候选
         topK: 5
         # 声学判定阈值（BirdNET+ analyze.py 默认 0.15，web-demo 默认 0.25）
