@@ -486,6 +486,82 @@ check('an ordinary prompt is left to the model', plain.fellThrough === true && p
 const otherCommand = await runPreStep({ messages: [{ id: 'm4', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '/birdstatus' }] }] });
 check('another command is left to the registry', otherCommand.fellThrough === true && otherCommand.appended.length === 0);
 
+// --- a recording arrives as its own message, with no /birds line at all ---
+// QQ sends the media and the caption as two messages: the recording lands as a
+// message whose only payload is a <dsh_im_files> manifest, and "/birds" follows
+// in a separate turn. That manifest-only message used to go to the model, so
+// the command afterwards had no file to work with — the reported bug.
+const loneStagedDir = path.join(mockWorkspace, '.dsh-im', 'inbound', '20261107-130000-LONEAA');
+fs.mkdirSync(loneStagedDir, { recursive: true });
+fs.writeFileSync(path.join(loneStagedDir, '01-voice.mp3'), Buffer.concat([Buffer.from('ID3'), Buffer.alloc(128)]));
+
+const loneSession = 'session-im-lone-recording';
+const loneLine = {
+  id: 'm-lone',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-LONE"}</dsh_im_source>' },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"voice.mp3","path":".dsh-im/inbound/20261107-130000-LONEAA/01-voice.mp3"}]}</dsh_im_files>',
+    },
+  ],
+};
+const loneTaken = await runPreStep({ sessionId: loneSession, messages: [loneLine] });
+check('a recording sent without /birds is claimed at the turn boundary', loneTaken.fellThrough === true && loneTaken.appended.length === 0, JSON.stringify(loneTaken.decision).slice(0, 160));
+const loneCall = await driveModelCall({ sessionId: loneSession, messages: [loneLine] });
+const loneText = loneCall.chunks[0]?.text ?? '';
+check(
+  'the recording sent on its own is recognised instead of reaching the model',
+  loneCall.fellThrough === false
+    && loneText.length > 0
+    && !loneText.includes('没有收到图片或录音')
+    && !loneText.includes('用法：/birds'),
+  loneText,
+);
+
+// A photo is never claimed that way: QQ keeps a photo and its caption in one
+// message, so an image manifest on its own is an ordinary prompt.
+const loneImageDir = path.join(mockWorkspace, '.dsh-im', 'inbound', '20261107-130500-LONEIMG');
+fs.mkdirSync(loneImageDir, { recursive: true });
+fs.writeFileSync(path.join(loneImageDir, '01-photo.jpg'), Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+const loneImage = {
+  id: 'm-lone-img',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-LONE"}</dsh_im_source>' },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"photo.jpg","path":".dsh-im/inbound/20261107-130500-LONEIMG/01-photo.jpg"}]}</dsh_im_files>',
+    },
+  ],
+};
+const loneImageTaken = await runPreStep({ sessionId: 'session-im-lone-image', messages: [loneImage] });
+check('a photo sent without /birds still goes to the model', loneImageTaken.fellThrough === true && loneImageTaken.appended.length === 0);
+
+// --- /birdstatus from a chat bridge ---
+// The registry only owns a line a DSH client routes there. A bridge hands it to
+// the model, which has no such command and answered "没有名为 birdstatus 的
+// 工具或命令入口" — the plugin's own status command never ran.
+const statusSession = 'session-im-status';
+const statusLine = {
+  id: 'm-status',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-STATUS"}</dsh_im_source>' },
+    { type: 'text', text: '/birdstatus' },
+  ],
+};
+const statusTaken = await runPreStep({ sessionId: statusSession, messages: [statusLine] });
+check('a bridged /birdstatus is claimed at the turn boundary', statusTaken.fellThrough === true && statusTaken.appended.length === 0, JSON.stringify(statusTaken.decision).slice(0, 160));
+const statusCall = await driveModelCall({ sessionId: statusSession, messages: [statusLine] });
+const statusText = statusCall.chunks[0]?.text ?? '';
+check('a bridged /birdstatus answers with the plugin status', statusCall.fellThrough === false && statusText.includes('imageModel') && statusText.includes('audioModel'), statusText);
+check('the bridged status answer ends with a stop finish', statusCall.chunks.at(-1)?.reason?.kind === 'stop', JSON.stringify(statusCall.chunks.at(-1)));
+
 const batched = await runPreStep({ messages: [birdsLine, { id: 'm5', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] }] });
 check('a queued prompt beside /birds is never swallowed', batched.fellThrough === true && batched.appended.length === 0);
 
