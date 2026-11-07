@@ -180,6 +180,8 @@ node scripts/download-models.mjs --check
 
 命令的 `input` 声明了 `attachments: true`，所以 DSH 会把附件经 `@deepseek-ai/dsh-attachment` 存储后传给你；插件用 `ctx.get('attachments').imageHostPath(ref)` / `fileHostPath(ref)` 拿到 Host 侧绝对路径再喂给模型。
 
+**附件没有扩展名**：DSH 的附件是内容寻址的（`~/.dsh/attachments/v1/objects/<xx>/<sha256>`），文件名就是一串哈希。所以插件不只看后缀 —— `classifyFile()` 先按扩展名分类，扩展名不认识（包括完全没有扩展名）时读文件头 64 字节按 magic 判断：JPEG / PNG / GIF / WebP / BMP / TIFF / HEIF / AVIF 当图片，WAV / MP3 / FLAC / OGG / AAC(ADTS) / M4A / AMR / WMA / AIFF 当音频。早期版本只看扩展名，手机直传的照片会报「无法判断文件类型：5ce3a0e2…」，现在这条已经堵住。
+
 ### 为什么带附件时也不会烧 token
 
 命令注册表只负责**客户端主动路由过来的行**。有的客户端（例如 DSH Go 的 composer）遇到「带附件的消息」会整行当普通 prompt 发给模型，根本不查命令表，于是 `/birds` + 一张照片就白烧一个回合。
@@ -307,7 +309,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 33 项 + `hosttest` 42 项 + `imports` 14 项，共 89 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 62 项 + `hosttest` 42 项 + `imports` 14 项，共 118 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

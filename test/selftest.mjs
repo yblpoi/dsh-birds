@@ -4,7 +4,7 @@ import os from 'node:os';
 import { parseWav } from '../lib/audio/wav.mjs';
 import { resampleTo } from '../lib/audio/resample.mjs';
 import { planChunks, sliceChunk } from '../lib/audio/chunk.mjs';
-import { isoWeek, kindOf } from '../lib/recognize.mjs';
+import { isoWeek, kindOf, sniffKind, classifyFile, isAttachmentBlob } from '../lib/recognize.mjs';
 import { formatImageResult, formatAudioResult, formatStatus } from '../lib/format.mjs';
 import { planChunks as pc } from '../lib/audio/chunk.mjs';
 
@@ -74,6 +74,48 @@ check('overlap increases windows', withOverlap.chunks.length === 3, withOverlap.
 check('kind jpg', kindOf('/tmp/a.JPG') === 'image');
 check('kind m4a', kindOf('/tmp/x.m4a') === 'audio');
 check('kind unknown', kindOf('/tmp/x.txt') === 'unknown');
+
+// ---- content sniffing: chat attachments carry no extension at all ----
+// A photo sent from dsh-Go's composer lands at
+// ~/.dsh/attachments/v1/objects/5c/<sha256> with no suffix, so extension-only
+// routing rejected a real JPEG with "无法判断文件类型：5ce3a0e2…". These
+// assertions pin the magic-byte fallback that makes such files routable.
+const sniffDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-sniff-'));
+function probeBytes(name, bytes) {
+  const target = path.join(sniffDir, name);
+  fs.writeFileSync(target, Buffer.concat([Buffer.from(bytes), Buffer.alloc(64)]));
+  return target;
+}
+const magicProbes = [
+  ['jpeg', 'image', [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43]],
+  ['png', 'image', [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ['gif', 'image', [...Buffer.from('GIF89a')]],
+  ['webp', 'image', [...Buffer.from('RIFF'), 0, 0, 0, 0, ...Buffer.from('WEBPVP8 ')]],
+  ['wav', 'audio', [...Buffer.from('RIFF'), 0, 0, 0, 0, ...Buffer.from('WAVEfmt ')]],
+  ['mp3', 'audio', [...Buffer.from('ID3'), 4, 0, 0, 0]],
+  ['adts', 'audio', [0xff, 0xf1, 0x50, 0x80]],
+  ['flac', 'audio', [...Buffer.from('fLaC')]],
+  ['ogg', 'audio', [...Buffer.from('OggS')]],
+  ['heic', 'image', [0, 0, 0, 0x18, ...Buffer.from('ftypheic')]],
+  ['m4a', 'audio', [0, 0, 0, 0x18, ...Buffer.from('ftypM4A ')]],
+  ['random', 'unknown', [0x00, 0x01, 0x02, 0x03]],
+];
+for (const [label, expected, bytes] of magicProbes) {
+  const probe = probeBytes('probe-' + label, bytes);
+  const sniffed = sniffKind(fs.readFileSync(probe));
+  const classified = await classifyFile(probe);
+  check('sniff ' + label + ' without extension', sniffed === expected, sniffed);
+  check('classify ' + label + ' without extension', classified === expected, classified);
+}
+// A misleading or missing suffix must not shadow the bytes.
+const disguised = path.join(sniffDir, 'photo.txt');
+fs.writeFileSync(disguised, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xdb]), Buffer.alloc(64)]));
+check('extensionless blob is sniffed despite a .txt name', (await classifyFile(disguised)) === 'image');
+check('known suffix still wins without reading the file', (await classifyFile('/tmp/never-opened.m4a')) === 'audio');
+check('missing file classifies as unknown', (await classifyFile(path.join(sniffDir, 'gone'))) === 'unknown');
+check('attachment blob names are recognised', isAttachmentBlob('/root/.dsh/attachments/v1/objects/5c/' + '5ce3a0e2'.repeat(8)));
+check('ordinary names are not attachment blobs', !isAttachmentBlob('/tmp/test.wav'));
+fs.rmSync(sniffDir, { recursive: true, force: true });
 
 // ---- iso week ----
 check('isoWeek 2026-01-01', isoWeek(new Date(Date.UTC(2026, 0, 1))) === 1, isoWeek(new Date(Date.UTC(2026, 0, 1))));

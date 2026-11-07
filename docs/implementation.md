@@ -44,6 +44,8 @@ DSH 内核 settle → 记录 command/done → 把 text 显示给用户
 
 录音同一条链路，只是中段换成：`readAudio` → 重采样 32 kHz → 3 秒分块 → `AcousticClassifier.analyze` → 可选 Geomodel 过滤。
 
+> **附件没有扩展名**：`admitCommandAttachments` 落盘是内容寻址的（`~/.dsh/attachments/v1/objects/<xx>/<sha256>`），文件名只有哈希。所以路由不能只看后缀：`classifyFile()` 先按扩展名分，未知时读前 64 字节按 magic 判断（JPEG/PNG/GIF/WebP/BMP/TIFF/HEIF→image，WAV/MP3/FLAC/OGG/AAC-ADTS/M4A/AMR/WMA/AIFF→audio）。踩过的坑：早期只按扩展名，手机直传的照片必然报 `无法判断文件类型：5ce3a0e2…`，现在由 `test/selftest.mjs` 的无扩展名用例钉住。
+
 ### 2.1 兜底：`agent/pre-step` 接管（客户端的坑）
 
 DSH Go（Flutter 客户端）的 `chat_screen.dart:486-493` 里写着：
