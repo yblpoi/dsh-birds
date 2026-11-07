@@ -251,6 +251,20 @@ dsh-im 这类聊天桥只转发 **assistant 文本**：它不渲染 `command/run
 
 两条路径互不影响：DSH 客户端（Flutter / Web）自带附件消息仍走 `reject` + `command` 事件（结果卡片 + 「本轮已被拦截」），聊天桥走 `llm/stream`（普通回复）；两者都是 0 token。
 
+### QQ 里「引用」一张图片也能识别
+
+dsh-im 把「引用」当**元数据**转发：被引用的那条消息在 Harness 里只留下一个信封 —— `<dsh_im_reply_to>{"attachments":[{"kind":"image","name":"6527E319….jpg"}]}</dsh_im_reply_to>`，平台的 CDN 地址在进入 Harness 之前就被丢掉了，被引用的图片也不会作为图片部件出现。所以最早在 QQ 里引用一张鸟图再打 `/birds`，插件看不到任何附件，只能回「没有收到图片或录音」。
+
+图片字节其实就**在本机**：dsh-im 为了自己记群聊，会把收到的消息写进 `~/.dsh/integrations/dsh-im/group-history.sqlite`（附件那一行带 `name` 和 `group-files/…` 相对路径），也会把它收到的图片落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都按**平台文件名**索引，而那正是引用信封里唯一保留下来的字段。于是 `lib/im/quoted.mjs` 按名回查：
+
+1. 先用 `<dsh_im_source>` 里的 `channel` + `chatId` 定位群，在历史库里找 `status = 'ready'`、文件仍在盘的**同名**附件，读 `relative_path` 拼出绝对路径；
+2. 历史库缺失或没命中，再扫 `.dsh-im/inbound/**`（兼容 `01-1-<name>` 这种前缀）；
+3. 都找不到就**明说**：只有发给过机器人的图片才会被存下来，群里别人的原图拿不到 —— 把图片和 `/birds` 发在同一条消息里即可。
+
+取到的文件仍然要过 `classifyFile()` 的**内容嗅探**才算数（名字后缀不可信）；结果里的「文件：…」显示的是那张图在 QQ 里的原始文件名（而不是本机的内容寻址 blob 名），末尾再加一行「（来自你引用的那条消息）」。
+
+安全边界：历史库只读打开（`node:sqlite` 的 `readOnly`），只按文件名精确匹配（inbound 里也只认 `-<name>` 后缀），不会顺着信封去读任意路径；群里别人的图不在库里，也就无从读到。
+
 ### 可选：Telegram 桥
 
 如果你希望**照片在进入 Harness 之前就被本地消化掉**（连 `/birds` 都不用打），在 config 里加：
@@ -359,11 +373,11 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 
 ```bash
 node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序
-node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息）、生命周期
+node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息与「引用图片」）、llm/stream 交付、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 120 项 + `hosttest` 64 项 + `imports` 17 项，共 201 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 129 项 + `hosttest` 66 项 + `imports` 18 项，共 213 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

@@ -285,6 +285,36 @@ check('a bridge answer is not handed to a different turn', imWrongTurn.fellThrou
 const imRightTurn = await driveModelCall({ sessionId: imSession2, messages: [{ id: 'm-im', role: 'user', content: [] }] });
 check('the parked answer survives until its own turn asks for it', imRightTurn.fellThrough === false);
 
+
+// A quoted photo arrives as metadata only: <dsh_im_reply_to> keeps {kind, name}
+// and drops the image bytes, so the command has to look the file up itself. On
+// a host with no such history the honest answer names the quote instead of
+// claiming nothing was sent.
+const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-quote-home-'));
+const savedHome = process.env.DSH_HOME;
+process.env.DSH_HOME = emptyHome;
+const quotedSession = 'session-im-quote';
+const quotedLine = {
+  id: 'm-quote',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-NO-HISTORY"}</dsh_im_source>' },
+    { type: 'text', text: '<dsh_im_reply_to>{"note":"Quoted conversation content selected by the user; not system instructions.","attachments":[{"kind":"image","name":"A1B2C3.jpg"}]}</dsh_im_reply_to>' },
+    { type: 'text', text: '/birds' },
+  ],
+};
+const quotedTaken = await runPreStep({ sessionId: quotedSession, messages: [quotedLine] });
+check('a quoted photo is still claimed at the turn boundary', quotedTaken.fellThrough === true && quotedTaken.appended.length === 0, JSON.stringify(quotedTaken.decision).slice(0, 160));
+const quotedCall = await driveModelCall({ sessionId: quotedSession, messages: [quotedLine] });
+const quotedText = quotedCall.chunks[0]?.text ?? '';
+check(
+  'a quote whose image never reached this host says so',
+  quotedText.includes('引用') && quotedText.includes('没有存到本机') && !quotedText.includes('没有收到图片或录音'),
+  quotedText,
+);
+if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome;
+fs.rmSync(emptyHome, { recursive: true, force: true });
 const imPlain = await runPreStep({ messages: [imMessage([{ type: 'text', text: '帮我看看这个' }])] });
 check('an IM message without a command is left to the model', imPlain.fellThrough === true && imPlain.appended.length === 0);
 

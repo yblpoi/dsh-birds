@@ -21,6 +21,7 @@ import {
 import { configureFfmpeg, describeFfmpeg, localFfmpegPath, provisionedFfmpegPath } from '../lib/ffmpeg.mjs';
 import { formatProvisioning } from '../lib/format.mjs';
 import { bindLabels, chineseName, labelDigest, nameTableStatus, resetNameTables } from '../lib/names.mjs';
+import { parseBridgeEnvelope, quotedMediaNames, resolveQuotedMedia } from '../lib/im/quoted.mjs';
 
 let failures = 0;
 function check(label, condition, detail) {
@@ -383,5 +384,68 @@ check(
 resetNameTables();
 check('reset forgets bindings', chineseName('image', 0) === undefined);
 
+
+// ---- quoted chat media: a quote keeps only the platform file name ----
+// dsh-im forwards a quoted message as <dsh_im_reply_to> with {kind, name} per
+// attachment and drops the CDN url, so /birds saw no attachment at all and
+// answered "没有收到图片或录音". The bytes are on disk in dsh-im's own history
+// store, keyed by that very name, so the command looks them up itself.
+const quotedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-quoted-'));
+const quotedIntegration = path.join(quotedRoot, 'integrations', 'dsh-im');
+const quotedBlobDir = path.join(quotedIntegration, 'group-files', 'group-1', 'message-1');
+fs.mkdirSync(quotedBlobDir, { recursive: true });
+const quotedBlob = path.join(quotedBlobDir, 'attachment-1');
+fs.writeFileSync(quotedBlob, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xdb]), Buffer.alloc(64)]));
+
+let sqliteModule;
+try {
+  sqliteModule = await import('node:sqlite');
+} catch {
+  sqliteModule = undefined;
+}
+if (sqliteModule !== undefined) {
+  const history = new sqliteModule.DatabaseSync(path.join(quotedIntegration, 'group-history.sqlite'));
+  history.exec('create table groups (id text primary key, channel text, platform_group_id text)');
+  history.exec('create table messages (id text primary key, group_id text, sent_at integer)');
+  history.exec('create table attachments (id text primary key, message_id text, name text, mime_type text, size_bytes integer, relative_path text, status text)');
+  history.prepare('insert into groups (id, channel, platform_group_id) values (?, ?, ?)').run('g1', 'qq', 'G-QUOTE');
+  history.prepare('insert into messages (id, group_id, sent_at) values (?, ?, ?)').run('m1', 'g1', 1);
+  history.prepare('insert into attachments (id, message_id, name, mime_type, size_bytes, relative_path, status) values (?, ?, ?, ?, ?, ?, ?)')
+    .run('a1', 'm1', 'A1B2C3.jpg', 'image/jpeg', 68, 'group-files/group-1/message-1/attachment-1', 'ready');
+  history.close();
+}
+
+const quotedEnvelope = parseBridgeEnvelope([
+  { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-QUOTE"}</dsh_im_source>' },
+  { type: 'text', text: '<dsh_im_reply_to>{"attachments":[{"kind":"image","name":"A1B2C3.jpg"}]}</dsh_im_reply_to>' },
+  { type: 'text', text: '/birds' },
+]);
+check('a bridged message yields its source and its quote', quotedEnvelope.source?.chatId === 'G-QUOTE' && quotedEnvelope.replyTo?.attachments?.[0]?.name === 'A1B2C3.jpg');
+check('a quote only names its media', quotedMediaNames(quotedEnvelope.replyTo).map((entry) => entry.name).join(',') === 'A1B2C3.jpg');
+check('a text-only quote asks for no media', quotedMediaNames({ content: 'hi' }).length === 0);
+check('a malformed quote is ignored instead of thrown', parseBridgeEnvelope([{ type: 'text', text: '<dsh_im_reply_to>not json</dsh_im_reply_to>' }]).replyTo === undefined);
+
+if (sqliteModule !== undefined) {
+  const recovered = await resolveQuotedMedia({ replyTo: quotedEnvelope.replyTo, source: quotedEnvelope.source, dshHome: quotedRoot });
+  check('a quoted image is recovered from the chat history store', recovered.files[0]?.path === quotedBlob, JSON.stringify(recovered));
+  check('the recovered blob is the quoted picture', (await classifyFile(recovered.files[0]?.path)) === 'image');
+  const neverReceived = await resolveQuotedMedia({ replyTo: { attachments: [{ kind: 'image', name: 'NOPE.jpg' }] }, source: quotedEnvelope.source, dshHome: quotedRoot });
+  check('an image the bot never received stays unresolved', neverReceived.files.length === 0 && neverReceived.unresolved[0]?.name === 'NOPE.jpg', JSON.stringify(neverReceived));
+}
+
+const stagedDir = path.join(quotedRoot, 'im', '.dsh-im', 'inbound', '20261107-120000-AAAAAA');
+fs.mkdirSync(stagedDir, { recursive: true });
+const stagedFile = path.join(stagedDir, '01-1-STAGED.jpg');
+fs.writeFileSync(stagedFile, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xdb]), Buffer.alloc(64)]));
+const staged = await resolveQuotedMedia({
+  replyTo: { attachments: [{ kind: 'image', name: 'STAGED.jpg' }] },
+  source: { channel: 'qq', conversationType: 'direct' },
+  dshHome: quotedRoot,
+  cwd: path.join(quotedRoot, 'no-workspace'),
+});
+check('a staged inbound image is found by its platform name', staged.files[0]?.path === stagedFile, JSON.stringify(staged));
+const noMedia = await resolveQuotedMedia({ replyTo: { content: '只有文字' }, dshHome: quotedRoot });
+check('a text-only quote resolves to nothing instead of throwing', noMedia.files.length === 0 && noMedia.unresolved.length === 0);
+fs.rmSync(quotedRoot, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);

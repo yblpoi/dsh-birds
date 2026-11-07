@@ -97,6 +97,12 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 
 **correlation 与清理**：暂存键是 `sessionId`，兑现前核对请求里的 user 消息 id 是否就是被接管的那条（不是就不动，留给真正的回合），兑现即删除；120 s 内没等到请求就作废。teardown 时整表清空。`test/host-mock.mjs` 用 `driveModelCall()` 驱动 `llm/stream` 钩子，钉住：桥消息→不写 command 事件、下次请求拿到本地文本、只消费一次、不串会话、不串回合。
 
+**「引用」的消息只剩文件名**：dsh-im 的 QQ 适配器取引用时只映射 `{kind, name}`（bundle 里的 `function iY(n)`：`attachments.map(r => { const s = ei(r?.filename); return { kind: Qne(r), ...s ? { name: s } : {} }; })`），平台 CDN 的 `url` 在进 Harness 之前就丢了；引用摘要 `zNe(n)` → `WNe(n)` 被序列化成 `<dsh_im_reply_to>…</dsh_im_reply_to>` 的 text part，被引用的图**也不会**出现在本条消息的 `images` 里（`Tv(n,{deferImages:true})` 算完文本就 `return s`）。所以 QQ 里「引用一张鸟图 + /birds」，插件拿到的只有一行 JSON 和一个文件名，回「没有收到图片或录音」。
+
+字节其实在本机：dsh-im 把群聊抄进 `~/.dsh/integrations/dsh-im/group-history.sqlite`，附件行是 `attachments(id, message_id, source_attachment_key, name, mime_type, size_bytes, relative_path, status, last_error)`，实体文件在同目录的 `group-files/<groupId>/<messageId>/<attachmentId>`；它收到的图也落在工作区 `.dsh-im/inbound/<时间>-<随机>/01-1-<name>`。两处都以平台文件名索引，正好是信封里保留下来的那个字段，于是 `lib/im/quoted.mjs` 的 `resolveQuotedMedia()` 按名回查：① `<dsh_im_source>` 的 `channel` + `chatId` 对上 `groups(channel, platform_group_id)`，在库里找 `status='ready'`、`relative_path` 非空且文件仍在的同名附件（`order by m.sent_at desc limit 3`，认最新的）；② 落空就扫 `.dsh-im/inbound/**`，接受 `name` 或 `-<name>` 后缀；③ 都没有就返回 `unresolved`，文案明说「只有发给过机器人的图片才会被存下来」。取到的文件仍要过 `recognizeFile` 的 `classifyFile()` 内容嗅探。
+
+安全边界：`DatabaseSync(path, { readOnly: true })` 只读打开（`node:sqlite` 在 Node 22+ 内置，动态 import 失败就跳过这一步只走 inbound），查询参数只有文件名与群标识，路径由库里的 `relative_path` 拼出且 `stat` 校验 `isFile`、`size > 0`；`size_bytes` 与磁盘不符只 warn 并以磁盘字节为准。不会顺着信封读任意路径 —— 群里别人的原图本来就不在库里。
+
 ---
 
 ## 3. 为什么不能改 dsh-im（证据）
@@ -213,7 +219,8 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 120 + 64 + 17 = 201 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 129 + 66 + 18 = 213 条断言全 PASS |
+| 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
 | 中英对照名表 | selftest 校验名表行数、抽样中文名、指纹不符时停用 | 图片 9826/10480、声音 9794/11560 |
 
