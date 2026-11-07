@@ -62,25 +62,30 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 | 事实 | 出处 |
 | --- | --- |
 | `agent/pre-step` 是 waterfall，不调 `next()` 即否决整条链（含内建行为） | `cordis/lib/index.js:896-921`（注释 846-852） |
-| 返回 `{kind:'enter', messages: []}` 时，代码走 `if (phase.step === 0 && decision.messages.length === 0) { turnEnds = {kind:'completed'}; return false; }` | `dsh-agent-loop/lib/index.js:753-757` |
+| 返回 `{kind:'enter', messages: []}` 时，代码走 `if (phase.step === 0 && decision.messages.length === 0) { turnEnds = {kind:'completed'}; return false; }`；但 `messages` 可被外层包装器追加，撑成真实一步 | `dsh-agent-loop/lib/index.js:753-757` |
+| 返回 `{kind:'reject'}` 时走 `if (decision.kind === "reject") { turnEnds = {kind:"blocked"}; return false; }`，不进入 `step()` | `dsh-agent-loop/lib/index.js:747-751` |
 | `user/message` 是在 `step()` 里才 append 的，位于 pre-step **之后** | `dsh-agent-loop/lib/index.js:861-868` |
 | `command/run`、`command/done` 在 `KNOWN_SESSION_EVENT_TYPES` 内、**不在** `SURFACE_EVENT_TYPES` 内，可两参 `session.append` | `dsh-session/lib/index.js` |
 | 客户端 `CommandLog` 只认 `data['commandId']` 的 `command/run` + `command/done` 对 | `chat_state.dart:1969-2040` |
-| turn 以 `completed` 结束时，optimistic 气泡静默消失；只有 `error/aborted/interrupted` 才显示失败卡片 | `chat_state.dart:936-955` |
+| turn 以 `completed` 结束时，optimistic 气泡静默消失；只有 `error/aborted/interrupted` 才显示失败卡片；`blocked` 会在结果下方标一行「本轮已被拦截」，不算失败 | `chat_state.dart:936-955` |
 | 监听器顺序由 `options.prepend` 决定（`unshift` 到表头，`waterfall` 从头 `shift()` 取，所以表头＝最外层） | `cordis/lib/index.js:903-916`（`register` 的 `method` 选择）、`:927-933` |
 | 内建监听器 `dsh-time-context` 先 `await next()`，再把 time-context 消息 `push` 进 `decision.messages` | `dsh-time-context/lib/index.js:249-253` |
 
 实现（`lib/index.js` 的 `interceptBirds`）：
 
 1. `step !== 1`、signal 已中止、或这一批不是**恰好一条**消息 → `next()`，交回正常链路。
-2. 取消息首个 text part，用与内核相同的行语法 `^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])` 解析；命令名不是 `birds` → 放行。
+2. 扫描消息里**所有** text part（不是只取第一个），用与内核相同的行语法 `^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])` 解析；命令名不是 `birds` → 放行。
 3. 自己 mint `cmd-<8位随机>-<自增>`，`session.append('command/run', {commandId, name, args?, source:{kind:'user'}})`。
 4. 复用命令 handler 的识别逻辑算出文本，再 `append('command/done', {commandId, kind, text})`。
-5. `return { kind: 'enter', messages: [] }`。
+5. `return { kind: 'reject' }`。
 
-**注册必须 `prepend: true`（实测踩过）**：第一版用默认注册位置，真机上仍然跑完了一个模型回合——session 里 `command/done` 之后紧跟 `step/start` → `request/header`。原因是 `dsh-time-context` 这类监听器跑在外层，`await next()` 拿到我们的空 `enter` 后往里追加了一条 time-context 消息，内核看到 `messages.length === 1` 就走了正常 step。改成 `ctx.on('agent/pre-step', interceptBirds, { prepend: true })` 让钩子站在瀑布最外层、不调 `next()` 直接收口，才真正做到零 token（真机复测：turn 的 `command/done` 之后直接 `turn/end{kind:'completed'}`，全段没有 `step/start` 与 `request/header`）。
+**收口必须用 `reject`（两次实测踩过）**：第一版返回 `{kind:'enter', messages: []}`、默认注册位置，真机上 `command/done` 之后仍紧跟 `step/start` → `request/header`；原因是 `dsh-time-context` 这类监听器跑在外层，`await next()` 拿到空 `enter` 后往里追加了一条 time-context 消息，内核看到 `messages.length === 1` 就走了正常 step。改成 `prepend: true` 后一度在「上下文已送过」的旧会话里成功，但**新会话第一次仍复发**：`dsh-time-context` 自己也用 `{ prepend: true }` 注册且在 profile 插件之后加载，unshift 后仍可能排到我们外面，而新会话第一步必然要追加 time-context / runtime-context 快照。最终改成 `{ kind: 'reject' }`：rejection 不带消息列表，内建包装器（time-context / agent-instructions / action-cards / plan-mode / goal-round-driver / tmux-context / agent / compaction-basic，逐个核对过）要么显式透传 reject、要么只 `return next()`，没人能把回合重新打开。真机复测（11:05，新会话、带照片）：`agent/inbox/spliced inserted=1` → `turn/start{turn:2}` → `spliced removed=1` → `command/run` → `command/done{kind:'success'}` → `spliced` → `turn/end{kind:'blocked'}`，全段无 `step/start`、无 `request/header`；UI 显示识别结果 + 一行「本轮已被拦截」。
+
+**聊天桥会把命令行夹在中间（真机踩过）**：dsh-im 接的 QQ / 微信不直接发用户那一行，而是把一条消息拆成多个 text part —— `<dsh_im_source>{...}</dsh_im_source>` 信封、每张图的 `图片 1（原图文件：…）` 说明、`<dsh_im_files>{...}` 文件清单，用户输入的 `/birds` 只是其中一个 part。第一版用 `content.find(part => part.type === 'text')` 取第一个 text part，拿到的必然是信封文本，命令行永远解析不到，于是 QQ 里的照片 + `/birds` 被当成普通 prompt 送进模型（真机 session：`command/done` 不存在，直接 `request/header{provider:'deepseek-account', model:'deepseek-flash'}`，模型自己调 bash/read_image）。修法是遍历全部 text part 找命令行，附件仍从 `type:'image'|'file'` 且带 `attachment` 的 part 取；`test/host-mock.mjs` 用一份 QQ 形态的消息（信封 + `/birds` + 图注 + image + 清单）钉住这个行为。
 
 **为什么只认单条批次**：`inbox.claim()` 在 pre-step 之前就把这批消息从待发队列里取走了，且不可撤销。若同批还有用户排队的别的 prompt，一起吞掉就是丢输入。所以宁可在多消息批次上放行（退回旧行为），也不冒吞消息的风险。
+
+**结果不止英文**：名表按标签行号对齐（图片 10480 行、声音 11560 行），每份都记着生成时标签文件的 SHA-256；分类器读完标签先 `bindLabels(kind, labelDigest(text))`，指纹不符就停用名表退回英文名（否则行号一错就会把别种鸟的中文名贴上来）。名表来自 IOC World Bird List 15.1 / 14.2（经 SuperPicky 的 `ioc/birdname.db` 整理），覆盖率图片 9826/10480、声音 9794/11560，未覆盖的是 BirdNET 里昆虫/蛙等非鸟群。排版在 `format.mjs` 的 `speciesLabel()`：有中文就「中文名（English）」，没有就英文名，声音再退学名。
 
 **为什么不用 `llm/stream` 伪造窗口**：那条路也能短路（`api-catalog.js:5019-5024`），但 yield 出来的 chunk 会被写进 `assistant/message`，属于伪造模型输出；而 `assistant/message` 的重放校验要求 `source.kind === 'model'` 与 provider/model，下次加载 session 会直接失败。`command/run` + `command/done` 才是客户端本来就渲染、且没有任何伪造嫌疑的通道。
 
@@ -200,7 +205,9 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 102 + 50 + 16 = 168 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 120 + 56 + 17 = 193 条断言全 PASS |
+| 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
+| 中英对照名表 | selftest 校验名表行数、抽样中文名、指纹不符时停用 | 图片 9826/10480、声音 9794/11560 |
 
 ---
 

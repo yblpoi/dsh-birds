@@ -20,6 +20,7 @@ import {
 } from '../lib/provision.mjs';
 import { configureFfmpeg, describeFfmpeg, localFfmpegPath, provisionedFfmpegPath } from '../lib/ffmpeg.mjs';
 import { formatProvisioning } from '../lib/format.mjs';
+import { bindLabels, chineseName, labelDigest, nameTableStatus, resetNameTables } from '../lib/names.mjs';
 
 let failures = 0;
 function check(label, condition, detail) {
@@ -137,18 +138,23 @@ check('isoWeek 2026-11-06 in 1..48', (() => { const w = isoWeek(new Date(Date.UT
 // ---- formatters ----
 const imageText = formatImageResult({
   candidates: [
-    { scientific: 'Turdus_merula', common: '', score: 0.91 },
+    { scientific: 'Turdus_merula', common: '', score: 0.91, chinese: '欧乌鸫' },
     { scientific: 'Turdus_philomelos', common: '', score: 0.05 },
   ],
   elapsedMs: 1200,
   topK: 2,
   file: 'bird.jpg',
 });
-check('image text mentions species', imageText.includes('Turdus_merula'), imageText);
+check('image text mentions species', imageText.includes('Turdus merula'), imageText);
+check('image text pairs the Chinese name with the English one', imageText.includes('欧乌鸫（Turdus merula）'), imageText);
+check('image text keeps the English name when no Chinese name exists', imageText.includes('2. Turdus philomelos'), imageText);
 check('image text states zero token', imageText.includes('0 token'), imageText);
 
 const audioText = formatAudioResult({
-  detections: [{ scientific: 'Parus_major', common: 'Great Tit', score: 0.77, firstSeenSec: 0, lastSeenSec: 3, hits: 1 }],
+  detections: [
+    { scientific: 'Parus_major', common: 'Great Tit', score: 0.77, firstSeenSec: 0, lastSeenSec: 3, hits: 1, chinese: '大山雀' },
+    { scientific: 'Gryllus_campestris', common: 'Field Cricket', score: 0.3, firstSeenSec: 3, lastSeenSec: 6, hits: 1 },
+  ],
   windows: 2,
   durationSec: 6,
   elapsedMs: 2400,
@@ -157,6 +163,8 @@ const audioText = formatAudioResult({
   geoApplied: false,
 });
 check('audio text mentions common name', audioText.includes('Great Tit'), audioText);
+check('audio text pairs the Chinese name with the English one', audioText.includes('大山雀（Great Tit）'), audioText);
+check('audio text falls back to the scientific name without a Chinese name', audioText.includes('Field Cricket（Gryllus campestris）'), audioText);
 check('audio text reports windows', audioText.includes('2 个 3 秒窗口'), audioText);
 
 const emptyText = formatAudioResult({
@@ -173,6 +181,34 @@ const statusText = formatStatus({
   available: true,
 });
 check('status marks present/missing', statusText.includes('✓ imageModel') && statusText.includes('✗ audioModel'), statusText);
+
+const statusBilingual = formatStatus({
+  modelsDir: '/models',
+  status: {},
+  platform: 'linux',
+  arch: 'arm64',
+  node: 'v22.19.0',
+  available: true,
+  names: {
+    image: { bound: true, named: 9826, count: 10480 },
+    audio: { bound: true, named: 9794, count: 11560 },
+  },
+});
+check(
+  'status reports the bilingual name tables',
+  statusBilingual.includes('中文名表：已启用') && statusBilingual.includes('9826/10480'),
+  statusBilingual,
+);
+const statusMonolingual = formatStatus({
+  modelsDir: '/models',
+  status: {},
+  platform: 'linux',
+  arch: 'arm64',
+  node: 'v22.19.0',
+  available: true,
+  names: { image: { bound: false }, audio: { bound: false } },
+});
+check('status explains when names fall back to English', statusMonolingual.includes('中文名表：未启用'), statusMonolingual);
 
 // ---- GeoPrior: symbolic batch dim in the geomodel graph ----
 // This was a real regression: geo.predict() passed [null, 3] to runSession, and
@@ -317,6 +353,35 @@ const pendingLine = formatProvisioning({ running: false, totalFiles: 0, doneFile
 check('a never-started download counts what is pending', pendingLine.includes('7') && pendingLine.includes('自动下载已关闭'), pendingLine);
 const localLine = formatProvisioning({ running: false, totalFiles: 0, doneFiles: 0, autoDownload: true, pendingFiles: 0 });
 check('an installed plugin says nothing is left', localLine.includes('无需下载'), localLine);
+
+// ---- Chinese name tables: index aligned, digest guarded ----
+// The tables are generated against one exact label file each. If the label file
+// is replaced (new model release, hand-edited copy) the row numbers stop meaning
+// the same species, so the table must disable itself instead of mislabelling.
+const imageTable = JSON.parse(fs.readFileSync(new URL('../lib/names/image-zh.json', import.meta.url), 'utf8'));
+const audioTable = JSON.parse(fs.readFileSync(new URL('../lib/names/audio-zh.json', import.meta.url), 'utf8'));
+const namesStatus = nameTableStatus();
+check('image name table ships 10480 rows', namesStatus.image.count === 10480, String(namesStatus.image.count));
+check('audio name table ships 11560 rows', namesStatus.audio.count === 11560, String(namesStatus.audio.count));
+check(
+  'most image and audio species carry a Chinese name',
+  namesStatus.image.named >= 9800 && namesStatus.audio.named >= 9700,
+  JSON.stringify({ image: namesStatus.image.named, audio: namesStatus.audio.named }),
+);
+check('an unbound table refuses to answer', chineseName('image', 0) === undefined);
+check('labelDigest hashes the text as UTF-8', labelDigest('abc') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', labelDigest('abc'));
+check('a mismatched label file disables the table', bindLabels('image', 'deadbeef'.repeat(8)) === false);
+check('a mismatched table still refuses to answer', chineseName('image', 0) === undefined);
+check('a matching label file enables the image table', bindLabels('image', imageTable.labelsSha256) === true);
+check('the image table answers by row index', chineseName('image', 0) === imageTable.names[0] && chineseName('image', 0).length > 0, chineseName('image', 0));
+check('the image table leaves unmapped species empty', chineseName('image', imageTable.names.indexOf('')) === undefined);
+check(
+  'a matching label file enables the audio table',
+  bindLabels('audio', audioTable.labelsSha256) === true && chineseName('audio', 0) === audioTable.names[0],
+  chineseName('audio', 0),
+);
+resetNameTables();
+check('reset forgets bindings', chineseName('image', 0) === undefined);
 
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);

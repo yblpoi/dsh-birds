@@ -45,6 +45,8 @@ dsh-birds/
 │   │   └── birdnet.mjs          BirdNET+ 声学分类
 │   ├── geo.mjs                  Geomodel 地理先验（学名 join + 阈值硬过滤）
 │   ├── recognize.mjs            统一识别入口（命令与 IM 桥共用同一实现）
+│   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
+│   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
 ├── scripts/download-models.mjs  模型下载（支持断点续传）
@@ -195,30 +197,41 @@ node scripts/download-models.mjs --check
 ```
 声音识别结果（BirdNET+ V3.0 preview3.1 Global 11K · 本地推理）
 
-1. 大山雀 / Parus major　77.3%　0.0–3.0s　命中 1 段
-2. 白头鹎 / Pycnonotus sinensis　21.4%　3.0–6.0s　命中 1 段
+1. 欧亚大山雀（Great Tit）　77.3%　0.0–3.0s　命中 1 段
+2. 白头鹎（Light-vented Bulbul）　21.4%　3.0–6.0s　命中 1 段
 
 共 2 个 3 秒窗口（6.0 s）｜耗时 2.41 s｜未调用大模型｜0 token
+名称：中文名（English）对照；未收录的类群（昆虫、蛙类等）显示英文名与学名。
 ```
 
 命令的 `input` 声明了 `attachments: true`，所以 DSH 会把附件经 `@deepseek-ai/dsh-attachment` 存储后传给你；插件用 `ctx.get('attachments').imageHostPath(ref)` / `fileHostPath(ref)` 拿到 Host 侧绝对路径再喂给模型。
 
 **附件没有扩展名**：DSH 的附件是内容寻址的（`~/.dsh/attachments/v1/objects/<xx>/<sha256>`），文件名就是一串哈希。所以插件不只看后缀 —— `classifyFile()` 先按扩展名分类，扩展名不认识（包括完全没有扩展名）时读文件头 64 字节按 magic 判断：JPEG / PNG / GIF / WebP / BMP / TIFF / HEIF / AVIF 当图片，WAV / MP3 / FLAC / OGG / AAC(ADTS) / M4A / AMR / WMA / AIFF 当音频。早期版本只看扩展名，手机直传的照片会报「无法判断文件类型：5ce3a0e2…」，现在这条已经堵住。
 
+### 名称：中英对照
+
+模型的标签只有英文（图片名是 `White-bearded_Hermit` 这种下划线写法，声音标签带学名），所以插件自带一份中文名表，把「中文名（English）」并排显示；查不到中文的物种退回英文名，声音结果再退到学名 —— 宁可只显示英文，也不会张冠李戴。
+
+- 数据来源：**IOC World Bird List 15.1 / 14.2**（经 [SuperPicky](https://github.com/jamesphotography/SuperPicky) 的 `ioc/birdname.db` 整理，含中英文与学名）。
+- 按**标签行号**对齐，不是按名字查：`lib/names/image-zh.json`（10480 行）与 `audio-zh.json`（11560 行）和标签文件一一对应，覆盖率 **图片 9826/10480（93.8%）**、**声音 9794/11560（84.7%）**。声音未覆盖的主要是 BirdNET 里的非鸟类群（昆虫、蛙、蝉），它们本来就没有中文鸟名。
+- **指纹保护**：每份名表都记着生成时标签文件的 SHA-256，加载时先比对。标签文件换了版本（行号含义变了）就自动停用名表、退回英文名，避免把别种鸟的中文名贴上来。
+- `/birdstatus` 里有一行「中文名表：已启用（图片 9826/10480、声音 9794/11560，IOC 世界鸟类名录）」；显示「未启用」说明标签文件和名表对不上。
+
 ### 为什么带附件时也不会烧 token
 
 命令注册表只负责**客户端主动路由过来的行**。有的客户端（例如 DSH Go 的 composer）遇到「带附件的消息」会整行当普通 prompt 发给模型，根本不查命令表，于是 `/birds` + 一张照片就白烧一个回合。
 
-插件因此在回合边界上加了一道兜底钩子 `agent/pre-step`：命中 `/birds` 时自己算完，写回与命令注册表完全相同的一对 `command/run` + `command/done` 事件，然后返回 `{ kind: 'enter', messages: [] }` —— 内核看到「进入一个空 step」就直接把这一回合标成 completed，**不 append `user/message`、不建请求、不花 token**，UI 里照常出现一条命令结果。
+插件因此在回合边界上加了一道兜底钩子 `agent/pre-step`：命中 `/birds` 时自己算完，写回与命令注册表完全相同的一对 `command/run` + `command/done` 事件，然后返回 `{ kind: 'reject' }` —— 内核把这一回合直接收成 blocked，**不 append `user/message`、不建请求、不花 token**，UI 里照常出现命令结果（底下会标一行「本轮已被拦截」）。
 
-这个钩子必须注册在**最外层**（`ctx.on('agent/pre-step', interceptBirds, { prepend: true })`）。宿主自带的监听器（`dsh-time-context`、`dsh-agent-instructions`、`dsh-plan-mode` 等）都是先 `await next()` 再往 `decision.messages` 里追加自己的 context 消息；如果插在里层，返回的空 `enter` 会被它们撑成「一条消息」的 decision，内核于是照常建请求，白烧一个回合——这个坑真机复现过，`prepend` 是承重的。
+**为什么是 reject 而不是「空 enter」**：返回 `{ kind: 'enter', messages: [] }` 也能让内核把回合收掉（`phase.step === 0 && messages.length === 0` 分支），但它带着一个**可被追写的消息列表**。宿主的 `dsh-time-context`、`dsh-agent-instructions` 等监听器都是先 `await next()` 再往 `decision.messages` 里追加自己的 context 消息，而且它们也用 `prepend` 注册、可能排在我们外面（profile 插件加载得晚）。新会话第一步势必要送 time-context / runtime-context 快照，于是空 `enter` 被撑成「一条消息」的 decision，内核照常建请求、白烧一个回合——真机上 10:58 那次就是这么复发的。`reject` 没有消息列表，所有内建包装器都原样放过它，谁也没法把回合重新打开。钩子仍然用 `ctx.on('agent/pre-step', interceptBirds, { prepend: true })` 注册，站到瀑布最外层、不调 `next()`，既省掉别人的包装开销，也不给后来的包装器插队的机会。
 
 几个刻意的边界：
 
 - 只在 `step === 1` 且这一批**恰好只有这一条消息**时接管。同批还有别的 prompt（排队消息）、或行是在回合中途进来的，一律放行给正常链路，避免吞掉用户的其他输入。
+- **聊天桥包装过的消息也算**。dsh-im 接的 QQ / 微信会把整条消息拆成多个 text 部件（`<dsh_im_source>` 信封、每张图的说明、`<dsh_im_files>` 文件清单），用户那行 `/birds` 夹在中间。所以钩子会扫**所有** text 部件找命令行，而不是只看第一个 —— 早期只读 `content[0]`，QQ 里的照片 + `/birds` 就被当成普通 prompt 送进模型了。
 - 只认 `/birds`，`/birdstatus` 之类仍走注册表。
 - 不伪造 `assistant/message`：那种事件下次加载会话时会被校验出 `source.kind !== 'model'` 而整段失败。
-- 注册顺序同样是契约：`prepend: true` 让钩子跑在瀑布最外层，否则宿主的 context 包装器会把空 `enter` 变回一个真实 step。
+- **收口方式同样是契约**：返回 `reject` 而不是空 `enter`，并配 `prepend: true`。宿主的 context 包装器会往 `enter` 的 `messages` 里追加内容，把「空一步」撑成真实一步；`reject` 不带消息列表，它们只会原样透传。
 
 ### 可选：Telegram 桥
 
@@ -327,12 +340,12 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 ## 7. 自测
 
 ```bash
-node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 文本排版 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序
-node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管、生命周期
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序
+node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息）、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 102 项 + `hosttest` 50 项 + `imports` 16 项，共 168 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 120 项 + `hosttest` 56 项 + `imports` 17 项，共 193 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

@@ -32,6 +32,9 @@ const logger = {
   error: () => {},
 };
 
+// Set once a fixture image exists; stands in for the Host's attachment store.
+let attachmentHostPath;
+
 const ctx = {
   logger: () => logger,
   effect(generator, label) {
@@ -64,8 +67,8 @@ const ctx = {
   get(service) {
     if (service === 'attachments') {
       return {
-        imageHostPath: () => undefined,
-        fileHostPath: () => undefined,
+        imageHostPath: () => attachmentHostPath,
+        fileHostPath: () => attachmentHostPath,
       };
     }
     return undefined;
@@ -121,6 +124,7 @@ check('birdstatus explains that auto download is off', statusResult.text.include
 // --- attachment routing: an image host path is picked up ---
 const fakeImage = path.join(modelsDir, 'fake.jpg');
 fs.writeFileSync(fakeImage, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+attachmentHostPath = fakeImage;
 const withAttachment = await birdId.handler({
   commandId: 'c4',
   agent: { session: {} },
@@ -164,7 +168,7 @@ const birdsLine = {
 };
 const taken = await runPreStep({ messages: [birdsLine] });
 check('a bare /birds line is taken over', taken.fellThrough === false);
-check('the takeover enters a step with no messages', taken.decision.kind === 'enter' && taken.decision.messages.length === 0, JSON.stringify(taken.decision));
+check('the takeover rejects the turn instead of entering a step', taken.decision.kind === 'reject' && !('messages' in taken.decision), JSON.stringify(taken.decision));
 check('the takeover records command/run', taken.appended[0]?.type === 'command/run', JSON.stringify(taken.appended[0]?.data));
 check('the takeover records command/done', taken.appended[1]?.type === 'command/done', JSON.stringify(taken.appended[1]?.data));
 check('command/run carries the birds name', taken.appended[0]?.data?.name === 'birds', taken.appended[0]?.data?.name);
@@ -186,6 +190,63 @@ const withImage = await runPreStep({
 check('a /birds line with an image is also taken over', withImage.fellThrough === false);
 check('the takeover attempts the image and reports back', typeof withImage.appended[1]?.data?.text === 'string' && withImage.appended[1].data.text.length > 0);
 
+// Chat bridges (dsh-im: QQ, WeChat) wrap the user's line instead of sending it
+// alone: an envelope, a caption per image and a file manifest are separate text
+// parts, so the command is not content[0]. Reading only the first text part made
+// a QQ photo plus /birds look like an ordinary prompt and billed a model turn.
+function imMessage(parts) {
+  return {
+    id: 'm-im',
+    role: 'user',
+    source: { kind: 'user' },
+    content: [
+      {
+        type: 'text',
+        text: '<dsh_im_source>{"channel":"qq","conversationType":"direct","senderId":"4A18"}</dsh_im_source>'
+          + '\n\n<dsh_im_source_guidance>这是来自 QQ 的消息…</dsh_im_source_guidance>',
+      },
+      ...parts,
+      { type: 'text', text: '图片原文件已保存到工作区，文件清单中的图片序号与本条消息一致…' },
+      {
+        type: 'text',
+        text: '<dsh_im_files>{"files":[{"name":"1-E0481B.png","path":".dsh-im/inbound/x/01-1-E0481B.png"}]}</dsh_im_files>',
+      },
+    ],
+  };
+}
+
+const imTaken = await runPreStep({
+  messages: [imMessage([
+    { type: 'text', text: '/birds' },
+    { type: 'text', text: '图片 1（原图文件：1-E0481B.png）' },
+    { type: 'image', attachment: { id: 'a2' } },
+  ])],
+});
+check('an IM-wrapped /birds line with a photo is taken over', imTaken.fellThrough === false);
+check(
+  'the IM takeover rejects the turn instead of entering a step',
+  imTaken.decision.kind === 'reject' && !('messages' in imTaken.decision),
+  JSON.stringify(imTaken.decision).slice(0, 160),
+);
+check(
+  'the IM takeover records the command pair',
+  imTaken.appended[0]?.type === 'command/run' && imTaken.appended[1]?.type === 'command/done',
+  JSON.stringify(imTaken.appended.map((entry) => entry.type)),
+);
+check(
+  'the IM takeover finds the wrapped photo instead of asking for one',
+  typeof imTaken.appended[1]?.data?.text === 'string'
+    && !imTaken.appended[1].data.text.includes('没有收到图片或录音'),
+  imTaken.appended[1]?.data?.text,
+);
+
+const imLine = imMessage([{ type: 'text', text: '/birds /root/test.wav' }, { type: 'image', attachment: { id: 'a3' } }]);
+const imArgsTaken = await runPreStep({ messages: [imLine] });
+check('the IM takeover keeps what follows the command', imArgsTaken.appended[0]?.data?.args === ' /root/test.wav', JSON.stringify(imArgsTaken.appended[0]?.data));
+
+const imPlain = await runPreStep({ messages: [imMessage([{ type: 'text', text: '帮我看看这个' }])] });
+check('an IM message without a command is left to the model', imPlain.fellThrough === true && imPlain.appended.length === 0);
+
 const plain = await runPreStep({ messages: [{ id: 'm3', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '这是什么鸟？' }] }] });
 check('an ordinary prompt is left to the model', plain.fellThrough === true && plain.appended.length === 0);
 
@@ -205,7 +266,8 @@ check('a longer command name is not claimed', prefixed.fellThrough === true && p
 // The Host's own dsh-time-context listener awaits the inner chain and appends a
 // context message to whatever came back. On a phone that turned an empty
 // `enter` into a one-message decision, so the kernel started a real step and
-// billed a model turn. Only the outermost position avoids it.
+// billed a model turn. A rejection carries no message list, so a wrapper that
+// honours it cannot reopen the turn no matter where it sits.
 function composeWaterfall(steps, payload, inner) {
   const queue = [...steps];
   const dispatch = () => {
@@ -237,7 +299,7 @@ const outermostDecision = await composeWaterfall(
   outermostRun.payload,
   () => ({ kind: 'enter', messages: [birdsLine] }),
 );
-check('an outermost takeover leaves the turn with no messages', outermostDecision.kind === 'enter' && outermostDecision.messages.length === 0, JSON.stringify(outermostDecision).slice(0, 160));
+check('a takeover ends the turn instead of entering a step', outermostDecision.kind === 'reject' && !('messages' in outermostDecision), JSON.stringify(outermostDecision).slice(0, 160));
 
 const innerRun = preStepPayload();
 const innerDecision = await composeWaterfall(
@@ -245,7 +307,7 @@ const innerDecision = await composeWaterfall(
   innerRun.payload,
   () => ({ kind: 'enter', messages: [birdsLine] }),
 );
-check('an inner takeover gets widened by a wrapping listener', innerDecision.messages.length === 1, innerDecision.messages.length);
+check('a wrapping listener cannot reopen a rejected turn', innerDecision.kind === 'reject' && !('messages' in innerDecision), JSON.stringify(innerDecision).slice(0, 160));
 
 // --- lifecycle disposer ---
 check('lifecycle registered one teardown', effects.length >= 1, effects.length);
