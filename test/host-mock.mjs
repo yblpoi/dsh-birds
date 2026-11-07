@@ -25,6 +25,14 @@ const registered = [];
 const effects = [];
 const listeners = new Map();
 const listenerOptions = new Map();
+const injected = [];
+const routes = [];
+const webServer = {
+  register(route) {
+    routes.push(route);
+    return () => {};
+  },
+};
 const logger = {
   info: () => {},
   debug: () => {},
@@ -64,6 +72,17 @@ const ctx = {
       if (index >= 0) bucket.splice(index, 1);
     };
   },
+  inject(dependencies, callback) {
+    injected.push(dependencies);
+    return callback({
+      webServer,
+      effect(callback2, label) {
+        const disposer = callback2();
+        if (typeof disposer === 'function') effects.push(disposer);
+        return { label };
+      },
+    });
+  },
   get(service) {
     if (service === 'attachments') {
       return {
@@ -97,6 +116,34 @@ for (const definition of registered) {
 const birdId = registered.find((d) => d.name === 'birds');
 check('birds opts into attachments', birdId.input?.attachments === true, JSON.stringify(birdId.input));
 check('birds supplies an input hint', typeof birdId.input?.hint === 'string' && birdId.input.hint.length > 0);
+
+// --- the settings page routes (设置 → 插件 → dsh-birds) ---
+check(
+  'the plugin asks for the webServer service',
+  injected.some((dependencies) => Array.isArray(dependencies) && dependencies.includes('webServer')),
+  JSON.stringify(injected),
+);
+const routePaths = routes.map((route) => route.path);
+check('registers three settings routes', routes.length === 3, routePaths.join(','));
+check(
+  'registers the dsh-im status route',
+  routePaths.includes('/api/dsh-birds/dsh-im'),
+  routePaths.join(','),
+);
+check(
+  'registers the dsh-im patch route',
+  routePaths.includes('/api/dsh-birds/dsh-im/patch'),
+  routePaths.join(','),
+);
+check(
+  'registers the dsh-im restore route',
+  routePaths.includes('/api/dsh-birds/dsh-im/restore'),
+  routePaths.join(','),
+);
+check(
+  'every settings route is exact and callable',
+  routes.every((route) => route.kind === 'exact' && typeof route.handler === 'function'),
+);
 
 // --- handler behaviour with no attachments and no models ---
 const signal = new AbortController().signal;

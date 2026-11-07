@@ -115,6 +115,26 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 - 改的是**第三方插件的构建产物**：dsh-im 升级或 profile 重装会覆盖，需要重跑脚本；因此它只作为「引用图」的补丁，不承担命令路由。
 - `test/selftest.mjs` 用一份含两处锚点的小样本验证：改写生效、幂等、认不出时抛错；再用 `new Function` 把生成的 `__qbQuotedMedia` 装进桩 `hs`/`kVe` 跑真实入参 —— 引用图变成附件、`load()` 走平台白名单、重复/无 url/非图片/非白名单域名都不搬。
 
+**设置里的入口：`client.js` + `lib/im-patch-api.mjs`（1.0.0 起）**。宿主 0.2.x 的插件管理页**只提供布局**，卡片本身要插件自带浏览器半体：`package.json` 里声明 `dsh.manifestVersion: 1`、`dsh.client: { platform: 'web', inject: [] }` 和 `exports['./client']`（只声明 client 却没有这个 export，`dsh-client-modules` 会直接抛错），`client.js` 用 `window.__ModuleLoader__.load({ id: 'dsh-birds', factory })` 包成单文件，`exports.inject = ['slots']`，在 `apply` 里注册三处槽：
+
+| 槽 | key | 说明 |
+| --- | --- | --- |
+| `plugins.bundle.config` | `dsh-birds` | 当前宿主插件管理页的「包配置」区（`renderSlot('plugins.bundle.config', { view: 'page' }, { entryKey: pkg.name })`） |
+| `plugins.row.config` | `dsh-birds#dsh-birds` / `dsh-birds#birds` | 行级配置区，key 由 bundle 名 + `cordis.patch.yml` 的行 id 拼成；历史行 id 也注册一份，未命中的只是留在 ledger 里 |
+| `settings.plugin.item` | `dsh-birds` | 旧宿主（≤0.1.5）的设置页槽，向后兼容 |
+
+keyed 槽的 key 是共享命名空间，**同一个 key 注册两次会抛错**，而客户端 `apply` 抛错等于整个插件起不来 —— 所以这里只用自己的包名。卡片本身是普通 React：`view === 'summary'` 时返回 `null`（折叠行里不塞整张卡），否则画标题、状态行、每个 bundle 的路径/版本/备份、以及「注入补丁 / 还原 / 刷新」三个按钮，并 fetch 三条本机路由：
+
+| 路由 | 作用 |
+| --- | --- |
+| `GET /api/dsh-birds/dsh-im` | 找到哪些 `profiles/*/node_modules/@xmanrui/dsh-im/lib/index.js`、各自是否已打补丁、备份列表、插件版本 |
+| `POST /api/dsh-birds/dsh-im/patch` | 调 `patchDshImSource()` 写回（先备份 `index.js.orig-<sha8>`；幂等；认不出就报错不写） |
+| `POST /api/dsh-birds/dsh-im/restore` | 用最近的备份还原；内容已一致时不动文件（连续点两次是幂等的） |
+
+路由用 `ctx.inject(['webServer'], scoped => scoped.effect(...))` 注册，三条都是 `{ kind: 'exact', path }`；处理器只接受回环请求（`remoteAddress` + `Host` + `Sec-Fetch-Site`），写入类端点还要求同源证据（`Sec-Fetch-Site: same-origin` 或 `Origin` 与 Host 相符，桌面壳转发链则认宿主 Cookie）。写盘走「临时文件 + rename」并保留原 mode，避免宿主读到半截 bundle。宿主没有 `webServer`（无界面的组合）时整段静默跳过。
+
+手机侧能显示这张卡：DSH Go 的 `app/lib/plugins/seams/slot_catalog.dart` 把 `plugins.bundle.config` / `plugins.row.config` 都列进 `Slots.seated`（策略 `SeatPolicy.p0BundleConfig`，`inference: SlotInference.bundleConfig`），`plugin_detail_sheet.dart` 的 `configSeated` 分支会把它作为 **page 岛**（WebView 渲染 DSH Web 的该片段）放进插件详情页，所以卡片要按窄屏设计（按钮够大、状态行可换行、不依赖 hover）。
+
 ---
 
 ## 3. 为什么不能改 dsh-im（证据）
@@ -231,11 +251,14 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 138 + 66 + 18 = 222 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 139 + 72 + 19 + 67 = 297 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `hs`/`kVe` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；引用图变成附件并走平台白名单，重复/无 url/非图片/非白名单域名不搬 |
 | 聊天桥形态的消息 | host-mock 里用 QQ 形态（信封 + `/birds` + 图注 + image + 文件清单）驱动 pre-step | 被接管、写出 command/run + command/done、不落到模型 |
 | 中英对照名表 | selftest 校验名表行数、抽样中文名、指纹不符时停用 | 图片 9826/10480、声音 9794/11560 |
+| 设置卡路由 | settings 测试：假 dsh-im 安装目录 + 假 req/res 驱动三条路由 | 状态 200、打补丁 changed=1 且写入成功、二次 patch 幂等、还原回原文、非回环/跨站/方法不符/缺同源证据都拒绝、认不出的产物不改 |
+| 设置卡浏览器半体 | settings 测试：桩 `window.__ModuleLoader__` + 桩 `require('react')` 加载 `client.js` | 注册 `plugins.bundle.config`（key `dsh-birds`）、`plugins.row.config`（两个行 id）、旧 `settings.plugin.item`；summary 返回 null；各种状态文案与按钮可用性正确 |
+| 版本与清单 | `package.json` | `version` 1.0.0，且 `dsh.manifestVersion`、`dsh.client`、`exports['./client']` 齐备 |
 
 ---
 

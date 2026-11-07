@@ -29,8 +29,9 @@
 
 ```
 dsh-birds/
-├── package.json                 插件清单（main 指向 lib/index.js，dsh.bundle.patch 指向 cordis.patch.yml）
+├── package.json                 插件清单（main 指向 lib/index.js，dsh.bundle.patch 指向 cordis.patch.yml，dsh.client 指向 client.js）
 ├── cordis.patch.yml             加载补丁：- insert: - id: dsh-birds
+├── client.js                    浏览器半体：设置 → 插件 → dsh-birds 里的卡片（注入 / 还原 dsh-im 补丁）
 ├── lib/
 │   ├── index.js                 插件入口：注册 /birds 与 /birdstatus，可选的 Telegram 桥；另有 agent/pre-step 兜底（带附件的 /birds 不发给模型）
 │   ├── engine.mjs               三个模型的懒加载容器
@@ -48,6 +49,7 @@ dsh-birds/
 │   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
 │   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
+│   ├── im-patch-api.mjs         设置卡用的三条本机路由：dsh-im 补丁的状态 / 写入 / 还原
 │   ├── im/quoted.mjs            引用消息回查（按平台文件名找回本机上的引用图）
 │   └── im/telegram.mjs          可选：Telegram 长轮询桥（媒体直接本地答复）
 ├── scripts/download-models.mjs  模型下载（支持断点续传）
@@ -56,7 +58,8 @@ dsh-birds/
 └── test/
     ├── selftest.mjs             WAV/重采样/分块/排版 单元自测
     ├── host-mock.mjs            用 mock ctx 驱动插件，验证注册、handler 契约与 pre-step 接管
-    └── imports.mjs              动态导入每个模块，防止坏导出或坏导入路径
+    ├── imports.mjs              动态导入每个模块，防止坏导出或坏导入路径
+    └── settings.mjs             设置卡：三条路由的守卫/打补丁/还原 + 浏览器半体的槽位与文案
 ```
 
 ---
@@ -261,7 +264,11 @@ dsh-im 把「引用」当**元数据**转发：被引用的那条消息在 Harne
 
 所以引用图有两条路：
 
-**① 补 dsh-im 一处洞（推荐）** —— 让引用图变成**真正的附件**：
+**① 补 dsh-im 一处洞（推荐）** —— 让引用图变成**真正的附件**。
+
+在设置里点一下（手机也能用）：**设置 → 插件 → dsh-birds → 配置**，会看到一张「dsh-im 引用图补丁」卡片 —— 它列出本机各个 profile 里找到的 dsh-im（路径、版本）、是否已打补丁、备份在哪，点「注入补丁」写入、点「还原」用最近的备份回滚、点「刷新」重新读状态。DSH Go（手机）的插件详情页会以网页岛把这张卡整页渲染出来，操作完全一样。改完都要重启 DSH（或重开 App）才生效。
+
+终端里跑的是同一件事（等价，适合没有界面的机器）：
 
 ```bash
 cd ~/.dsh/profiles/desktop
@@ -269,7 +276,7 @@ node node_modules/dsh-birds/scripts/patch-dsh-im.mjs        # 先 --dry-run 看�
 # 改完重启 DSH（或重启 App）
 ```
 
-脚本只改一件事：在 dsh-im 的 inbound 构造器（`lib/index.js` 里 `function rY(n,{fetchImpl:t=fetch}={}){…}`）追加一句，把引用附件里有 `https` 地址、且不在本条消息已有附件里的**图片**塞进本条消息的 `images` 列表 —— 走的完全是普通图片那条 Harness 附件通道（dsh-im 自己的下载函数 + 平台 CDN 白名单），失败也只是这张图当没引。于是 `/birds` 和模型都能看到引用图。
+两种入口改的是同一处：在 dsh-im 的 inbound 构造器（`lib/index.js` 里 `function rY(n,{fetchImpl:t=fetch}={}){…}`）追加一句，把引用附件里有 `https` 地址、且不在本条消息已有附件里的**图片**塞进本条消息的 `images` 列表 —— 走的完全是普通图片那条 Harness 附件通道（dsh-im 自己的下载函数 + 平台 CDN 白名单），失败也只是这张图当没引。于是 `/birds` 和模型都能看到引用图。
 
 几个必须知道的点：
 
@@ -277,6 +284,7 @@ node node_modules/dsh-birds/scripts/patch-dsh-im.mjs        # 先 --dry-run 看�
 - 原文件先备份成 `lib/index.js.orig-xxxxxxxx`，`--restore=<备份路径>` 可还原。
 - 脚本按 5.8.0 的压缩产物定位（两处锚点各命中一次才动手）；认不出就**拒绝改**并说明原因，宁可不改也不乱改。
 - 只搬运图片。引用语音/文件仍按元数据处理，避免把不支持的格式硬塞进附件通道。
+- 设置卡走的是本机 HTTP 接口（`/api/dsh-birds/dsh-im`），只接受回环请求，写入类端点还要求同源证据（`Sec-Fetch-Site` / `Origin` / 宿主 Cookie）；接口和终端脚本共用同一份补丁实现，不会各改一套。
 
 **② 不打补丁时** —— 插件按文件名回查本机，只覆盖「发给过机器人的图」：
 
@@ -402,7 +410,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 138 项 + `hosttest` 66 项 + `imports` 18 项，共 222 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 139 项 + `hosttest` 72 项 + `imports` 19 项 + `settings` 67 项，共 297 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

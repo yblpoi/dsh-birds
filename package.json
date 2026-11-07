@@ -1,6 +1,6 @@
 {
   "name": "dsh-birds",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "DSH 本地鸟类识别插件：BirdTrace 图片识别 + BirdNET+ 声学识别 + Geomodel 地理先验，全程本机推理，不消耗 LLM token",
   "license": "MIT",
@@ -24,10 +24,12 @@
   "main": "./lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "client.js",
     "scripts",
     "docs",
     "cordis.patch.yml",
@@ -44,7 +46,8 @@
     "selftest": "node test/selftest.mjs",
     "hosttest": "node test/host-mock.mjs",
     "importtest": "node test/imports.mjs",
-    "test": "node test/selftest.mjs && node test/host-mock.mjs && node test/imports.mjs"
+    "settingstest": "node test/settings.mjs",
+    "test": "node test/selftest.mjs && node test/host-mock.mjs && node test/imports.mjs && node test/settings.mjs"
   },
   "dependencies": {
     "onnxruntime-node": "^1.31.1"
@@ -53,8 +56,16 @@
     "sharp": "^0.35.5"
   },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.1.7-rc.2"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   }
 }
