@@ -521,6 +521,47 @@ check(
   loneText,
 );
 
+// QQ sends "/birds" as the message *after* the recording, so the command lands
+// with no media of its own. It must answer with the recording that just arrived
+// rather than "没有收到图片或录音" — that reply, right after a recording, is the
+// exact bug the user reported.
+const followSession = 'session-im-recording-then-command';
+const followLine = {
+  id: 'm-follow',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-LONE"}</dsh_im_source>' },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"voice.mp3","path":".dsh-im/inbound/20261107-130000-LONEAA/01-voice.mp3"}]}</dsh_im_files>',
+    },
+  ],
+};
+await runPreStep({ sessionId: followSession, messages: [followLine] });
+await driveModelCall({ sessionId: followSession, messages: [followLine] });
+
+const bareCommandLine = {
+  id: 'm-bare',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"group","chatId":"G-LONE"}</dsh_im_source>' },
+    { type: 'text', text: '/birds' },
+  ],
+};
+const bareTaken = await runPreStep({ sessionId: followSession, messages: [bareCommandLine] });
+check('a /birds right after a recording is claimed', bareTaken.fellThrough === true && bareTaken.appended.length === 0);
+const bareCall = await driveModelCall({ sessionId: followSession, messages: [bareCommandLine] });
+const bareText = bareCall.chunks[0]?.text ?? '';
+check(
+  'a /birds sent after the recording uses that recording instead of asking for one',
+  bareCall.fellThrough === false
+    && bareText.length > 0
+    && !bareText.includes('没有收到图片或录音'),
+  bareText,
+);
+
 // A photo is never claimed that way: QQ keeps a photo and its caption in one
 // message, so an image manifest on its own is an ordinary prompt.
 const loneImageDir = path.join(mockWorkspace, '.dsh-im', 'inbound', '20261107-130500-LONEIMG');
