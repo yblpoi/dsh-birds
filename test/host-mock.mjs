@@ -24,6 +24,7 @@ function check(label, condition, detail) {
 const registered = [];
 const effects = [];
 const listeners = new Map();
+const listenerOptions = new Map();
 const logger = {
   info: () => {},
   debug: () => {},
@@ -48,10 +49,13 @@ const ctx = {
       return () => {};
     },
   },
-  on(event, listener) {
+  on(event, listener, options) {
     const bucket = listeners.get(event) ?? [];
     bucket.push(listener);
     listeners.set(event, bucket);
+    const optionsBucket = listenerOptions.get(event) ?? [];
+    optionsBucket.push(options);
+    listenerOptions.set(event, optionsBucket);
     return () => {
       const index = bucket.indexOf(listener);
       if (index >= 0) bucket.splice(index, 1);
@@ -125,6 +129,8 @@ check('birds with an attachment reports a readable failure', typeof withAttachme
 // --- turn-boundary takeover: a /birds line routed to the model ---
 const preStep = listeners.get('agent/pre-step') ?? [];
 check('registers one agent/pre-step listener', preStep.length === 1, preStep.length);
+const hookOptions = listenerOptions.get('agent/pre-step')?.[0] ?? {};
+check('the takeover hook runs outermost', hookOptions.prepend === true, JSON.stringify(hookOptions));
 
 /** Drive the listener the way the Host's waterfall does, with a stub session. */
 async function runPreStep(payload) {
@@ -182,6 +188,52 @@ check('a /birds line mid-turn is left alone', midTurn.fellThrough === true && mi
 
 const prefixed = await runPreStep({ messages: [{ id: 'm6', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '/birdsomething' }] }] });
 check('a longer command name is not claimed', prefixed.fellThrough === true && prefixed.appended.length === 0);
+
+// --- ordering against a wrapping listener ---
+// The Host's own dsh-time-context listener awaits the inner chain and appends a
+// context message to whatever came back. On a phone that turned an empty
+// `enter` into a one-message decision, so the kernel started a real step and
+// billed a model turn. Only the outermost position avoids it.
+function composeWaterfall(steps, payload, inner) {
+  const queue = [...steps];
+  const dispatch = () => {
+    const nextStep = queue.shift();
+    if (nextStep === undefined) return inner();
+    return nextStep(payload, () => dispatch());
+  };
+  return dispatch();
+}
+
+const timeContextLike = async (payload, next) => {
+  const decision = await next();
+  if (decision.kind === 'reject') return decision;
+  return {
+    ...decision,
+    messages: [...decision.messages, { id: 'ctx', role: 'user', source: { kind: 'time-context' }, content: [] }],
+  };
+};
+
+function preStepPayload() {
+  const appended = [];
+  const agent = { session: { append: (type, data) => appended.push({ type, data }) } };
+  return { appended, payload: { agent, step: 1, turn: 1, signal, messages: [birdsLine] } };
+}
+
+const outermostRun = preStepPayload();
+const outermostDecision = await composeWaterfall(
+  [preStep[0], timeContextLike],
+  outermostRun.payload,
+  () => ({ kind: 'enter', messages: [birdsLine] }),
+);
+check('an outermost takeover leaves the turn with no messages', outermostDecision.kind === 'enter' && outermostDecision.messages.length === 0, JSON.stringify(outermostDecision).slice(0, 160));
+
+const innerRun = preStepPayload();
+const innerDecision = await composeWaterfall(
+  [timeContextLike, preStep[0]],
+  innerRun.payload,
+  () => ({ kind: 'enter', messages: [birdsLine] }),
+);
+check('an inner takeover gets widened by a wrapping listener', innerDecision.messages.length === 1, innerDecision.messages.length);
 
 // --- lifecycle disposer ---
 check('lifecycle registered one teardown', effects.length >= 1, effects.length);

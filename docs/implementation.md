@@ -67,6 +67,8 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 | `command/run`、`command/done` 在 `KNOWN_SESSION_EVENT_TYPES` 内、**不在** `SURFACE_EVENT_TYPES` 内，可两参 `session.append` | `dsh-session/lib/index.js` |
 | 客户端 `CommandLog` 只认 `data['commandId']` 的 `command/run` + `command/done` 对 | `chat_state.dart:1969-2040` |
 | turn 以 `completed` 结束时，optimistic 气泡静默消失；只有 `error/aborted/interrupted` 才显示失败卡片 | `chat_state.dart:936-955` |
+| 监听器顺序由 `options.prepend` 决定（`unshift` 到表头，`waterfall` 从头 `shift()` 取，所以表头＝最外层） | `cordis/lib/index.js:903-916`（`register` 的 `method` 选择）、`:927-933` |
+| 内建监听器 `dsh-time-context` 先 `await next()`，再把 time-context 消息 `push` 进 `decision.messages` | `dsh-time-context/lib/index.js:249-253` |
 
 实现（`lib/index.js` 的 `interceptBirds`）：
 
@@ -75,6 +77,8 @@ if (drafts.isEmpty && quote == null && generate == null) { ... _slashFor(text) .
 3. 自己 mint `cmd-<8位随机>-<自增>`，`session.append('command/run', {commandId, name, args?, source:{kind:'user'}})`。
 4. 复用命令 handler 的识别逻辑算出文本，再 `append('command/done', {commandId, kind, text})`。
 5. `return { kind: 'enter', messages: [] }`。
+
+**注册必须 `prepend: true`（实测踩过）**：第一版用默认注册位置，真机上仍然跑完了一个模型回合——session 里 `command/done` 之后紧跟 `step/start` → `request/header`。原因是 `dsh-time-context` 这类监听器跑在外层，`await next()` 拿到我们的空 `enter` 后往里追加了一条 time-context 消息，内核看到 `messages.length === 1` 就走了正常 step。改成 `ctx.on('agent/pre-step', interceptBirds, { prepend: true })` 让钩子站在瀑布最外层、不调 `next()` 直接收口，才真正做到零 token（真机复测：turn 的 `command/done` 之后直接 `turn/end{kind:'completed'}`，全段没有 `step/start` 与 `request/header`）。
 
 **为什么只认单条批次**：`inbox.claim()` 在 pre-step 之前就把这批消息从待发队列里取走了，且不可撤销。若同批还有用户排队的别的 prompt，一起吞掉就是丢输入。所以宁可在多消息批次上放行（退回旧行为），也不冒吞消息的风险。
 
@@ -194,7 +198,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 33 + 42 + 14 = 89 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs` | 62 + 45 + 14 = 121 条断言全 PASS |
 
 ---
 

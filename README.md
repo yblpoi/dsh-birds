@@ -188,11 +188,14 @@ node scripts/download-models.mjs --check
 
 插件因此在回合边界上加了一道兜底钩子 `agent/pre-step`：命中 `/birds` 时自己算完，写回与命令注册表完全相同的一对 `command/run` + `command/done` 事件，然后返回 `{ kind: 'enter', messages: [] }` —— 内核看到「进入一个空 step」就直接把这一回合标成 completed，**不 append `user/message`、不建请求、不花 token**，UI 里照常出现一条命令结果。
 
+这个钩子必须注册在**最外层**（`ctx.on('agent/pre-step', interceptBirds, { prepend: true })`）。宿主自带的监听器（`dsh-time-context`、`dsh-agent-instructions`、`dsh-plan-mode` 等）都是先 `await next()` 再往 `decision.messages` 里追加自己的 context 消息；如果插在里层，返回的空 `enter` 会被它们撑成「一条消息」的 decision，内核于是照常建请求，白烧一个回合——这个坑真机复现过，`prepend` 是承重的。
+
 几个刻意的边界：
 
 - 只在 `step === 1` 且这一批**恰好只有这一条消息**时接管。同批还有别的 prompt（排队消息）、或行是在回合中途进来的，一律放行给正常链路，避免吞掉用户的其他输入。
 - 只认 `/birds`，`/birdstatus` 之类仍走注册表。
 - 不伪造 `assistant/message`：那种事件下次加载会话时会被校验出 `source.kind !== 'model'` 而整段失败。
+- 注册顺序同样是契约：`prepend: true` 让钩子跑在瀑布最外层，否则宿主的 context 包装器会把空 `enter` 变回一个真实 step。
 
 ### 可选：Telegram 桥
 
@@ -309,7 +312,7 @@ node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、p
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 ```
 
-在 Node.js v22+ 上 `selftest` 62 项 + `hosttest` 42 项 + `imports` 14 项，共 118 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 62 项 + `hosttest` 45 项 + `imports` 14 项，共 121 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 
