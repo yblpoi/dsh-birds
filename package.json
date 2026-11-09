@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "description": "DSH 本地鸟类识别插件：BirdTrace 图片识别 + BirdNET+ 声学识别 + Geomodel 地理先验，全程本机推理，不消耗 LLM token",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yblpoi/dsh-birds.git"

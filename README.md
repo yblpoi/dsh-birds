@@ -435,9 +435,13 @@ node test/settings.mjs    # 设置卡：三条路由的守卫 / 打补丁 / 还�
 
 ## 8. 许可与合规
 
-- 本插件代码：MIT（见 `LICENSE`）。
+- 本插件代码：**GNU AGPL-3.0**（见 `LICENSE`）。它不只是 MIT 的"保留版权"条款：
+  通过网络把本插件（或修改版）作为服务提供给别人使用时，也必须向使用者提供对应源码。
+  该协议从 1.1.0 起生效；更早的提交仍按当时的 MIT 发布。
 - **BirdTrace FastViT-MA36-10K：CC-BY-NC-4.0，禁止商业使用。**
 - **BirdNET+ V3.0 preview3.1**：Developer Preview，模型与标签会变；使用需遵守其 `TERMS_OF_USE`（Zenodo record 20703646 内附）。
 - **BirdNET+ Geomodel V3.0.4**：另有 `LICENSE-MODELS.md` / `ACCEPTABLE_USE.md`。
+- **YOLO26-seg（COCO 预训练权重）：AGPL-3.0（Ultralytics）。** 本插件只调用其 ONNX 推理产物，
+  不打包权重；权重由插件在运行时从 Hugging Face 下载。
 
 识别结果是统计模型的输出，**不是鉴定结论**；用于科研、观鸟记录请自行复核，不要用于法律、检疫、保护执法等场景。
