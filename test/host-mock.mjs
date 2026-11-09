@@ -690,6 +690,100 @@ check(
   (batchAudioCall.chunks[0]?.text ?? '').slice(0, 160),
 );
 
+// --- the workspace dsh-im actually uses on a phone ---
+// dsh-im runs QQ sessions in <DSH_HOME>/im, which is NOT one of DSH's
+// registered workspaces, and it resolves a manifest path against exactly that
+// directory. Resolving against the process cwd, the workspace store and
+// <DSH_HOME>/workspace alone found nothing, so a recording announced in a
+// manifest was reported as missing on every message that carried one.
+const imHomeWorkspace = path.join(mockHome, 'im');
+const imHomeDir = path.join(imHomeWorkspace, '.dsh-im', 'inbound', '20261109-104854-YehD1L');
+fs.mkdirSync(imHomeDir, { recursive: true });
+fs.writeFileSync(path.join(imHomeDir, '01-咕咕嘎嘎.mp3'), Buffer.concat([Buffer.from('ID3'), Buffer.alloc(256)]));
+
+const imHomeManifest = {
+  id: 'm-im-home',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [{
+    type: 'text',
+    text: '<dsh_im_files>{"description":"Files uploaded with this user message.","files":[{"name":"咕咕嘎嘎.mp3","path":".dsh-im/inbound/20261109-104854-YehD1L/01-咕咕嘎嘎.mp3"}]}</dsh_im_files>',
+  }],
+};
+const imHomeSource = {
+  id: 'm-im-home-src',
+  role: 'user',
+  source: { kind: 'plugin:dsh-im', form: 'notice', summary: 'qq · direct' },
+  content: [{ type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"direct","senderId":"4A18"}</dsh_im_source>' }],
+};
+
+const imHomeSession = 'session-im-home-workspace';
+// The decision alone proves nothing here: the bridged path deliberately lets
+// the turn start, so `enter` is what BOTH a takeover and a fall-through return.
+// Only the model call that follows separates them.
+await runPreStep({ sessionId: imHomeSession, messages: [imHomeSource, imHomeManifest] });
+const imHomeCall = await driveModelCall({ sessionId: imHomeSession, messages: [imHomeSource, imHomeManifest] });
+const imHomeText = imHomeCall.chunks[0]?.text ?? '';
+check(
+  'the recording staged under <DSH_HOME>/im is actually found',
+  imHomeCall.fellThrough === false
+    && !imHomeText.includes('没有收到图片或录音')
+    && !imHomeText.includes('找不到'),
+  imHomeText.slice(0, 200),
+);
+
+// The same message also arrives with the kernel's runtime-context snapshot,
+// which is the only per-turn statement of which workspace the turn belongs to.
+const runtimeHint = {
+  id: 'm-im-home-ctx',
+  role: 'user',
+  source: { kind: 'runtime-context' },
+  content: [{
+    type: 'text',
+    text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.'
+      + '\n\nCurrent working directory: "' + imHomeWorkspace + '"'
+      + '\n\nCurrent DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: "' + imHomeWorkspace + '".',
+  }],
+};
+const hintedSession = 'session-im-home-hinted';
+const hintedCall = await driveModelCall({
+  sessionId: hintedSession,
+  messages: await (async () => {
+    await runPreStep({ sessionId: hintedSession, messages: [runtimeHint, imHomeSource, imHomeManifest] });
+    return [runtimeHint, imHomeSource, imHomeManifest];
+  })(),
+});
+const hintedText = hintedCall.chunks[0]?.text ?? '';
+check(
+  'the runtime-context workspace hint still resolves the recording',
+  hintedCall.fellThrough === false
+    && !hintedText.includes('没有收到图片或录音')
+    && !hintedText.includes('找不到'),
+  hintedText.slice(0, 200),
+);
+
+// A photo staged there is still not a recording: an unasked image keeps going
+// to the model instead of being answered with the bird classifier.
+const imHomePhotoDir = path.join(imHomeWorkspace, '.dsh-im', 'inbound', '20261109-105000-Photo');
+fs.mkdirSync(imHomePhotoDir, { recursive: true });
+fs.writeFileSync(path.join(imHomePhotoDir, '01-photo.jpg'), Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+const photoOnly = {
+  id: 'm-im-home-photo',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [{
+    type: 'text',
+    text: '<dsh_im_files>{"files":[{"name":"photo.jpg","path":".dsh-im/inbound/20261109-105000-Photo/01-photo.jpg"}]}</dsh_im_files>',
+  }],
+};
+const photoSession = 'session-im-home-photo';
+const photoTaken = await runPreStep({ sessionId: photoSession, messages: [imHomeSource, photoOnly] });
+check(
+  'a photo staged in the bridge workspace still goes to the model',
+  photoTaken.fellThrough === true && photoTaken.appended.length === 0,
+  JSON.stringify(photoTaken.decision).slice(0, 160),
+);
+
 
 // --- ordering against a wrapping listener ---
 // The Host's own dsh-time-context listener awaits the inner chain and appends a
