@@ -832,6 +832,55 @@ const innerDecision = await composeWaterfall(
 );
 check('a wrapping listener cannot reopen a rejected turn', innerDecision.kind === 'reject' && !('messages' in innerDecision), JSON.stringify(innerDecision).slice(0, 160));
 
+// --- one photo, delivered twice ---
+// A QQ photo reaches the command through two independent routes: the Host
+// attaches its own content-addressed copy (an image part, named by hash), and
+// the bridge stages the very same bytes inside the session workspace under the
+// platform file name and announces that path in <dsh_im_files>. Recognising
+// both printed two identical `【n】` blocks for one photo. Identity is the
+// content, so the second copy must collapse into the first.
+const dupBlobName = 'b1a65527660158e4e23d9c95ff1e4ed00c3970ccbd2cc03d241966023e26532c';
+const dupBlobDir = path.join(mockHome, 'attachments', 'v1', 'objects', 'b1');
+fs.mkdirSync(dupBlobDir, { recursive: true });
+const dupBlob = path.join(dupBlobDir, dupBlobName);
+const dupBytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(512, 0x41), Buffer.from([0xff, 0xd9])]);
+fs.writeFileSync(dupBlob, dupBytes);
+const dupStagedDir = path.join(mockHome, 'im', '.dsh-im', 'inbound', '20261109-114042-s2CIRC');
+fs.mkdirSync(dupStagedDir, { recursive: true });
+fs.writeFileSync(path.join(dupStagedDir, '01-1-3D92.jpg'), dupBytes);
+attachmentHostPath = dupBlob;
+
+const dupLine = {
+  id: 'm-dup',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [
+    { type: 'text', text: '/birds' },
+    { type: 'text', text: '<dsh_im_source>{"channel":"qq","conversationType":"direct"}</dsh_im_source>' },
+    { type: 'image', attachment: { id: 'a-dup' } },
+    {
+      type: 'text',
+      text: '<dsh_im_files>{"files":[{"name":"1-3D92.jpg","path":".dsh-im/inbound/20261109-114042-s2CIRC/01-1-3D92.jpg","mediaType":"image/jpeg"}]}</dsh_im_files>',
+    },
+  ],
+};
+// The models are absent in this test, so recognition never runs and the reply
+// can only ever say the models are missing — which makes an assertion on the
+// reply text useless here (verified: deleting the dedupe call entirely still
+// passes it). What this block does assert is that a photo plus its manifest
+// copy is still claimed at the turn boundary and answered without a model.
+// The dedupe rule itself is covered against real bytes in selftest.mjs, where
+// removing it produces three failures.
+const dupSession = 'session-im-one-photo-twice';
+const dupTaken = await runPreStep({ sessionId: dupSession, messages: [dupLine] });
+const dupCall = await driveModelCall({ sessionId: dupSession, messages: [dupLine] });
+const dupText = dupCall.chunks[0]?.text ?? '';
+check(
+  'a photo plus its staged copy is still claimed at the turn boundary',
+  dupTaken.fellThrough === true && dupCall.fellThrough === false && dupText.length > 0,
+  dupText.slice(0, 200),
+);
+
 // --- lifecycle disposer ---
 check('lifecycle registered one teardown', effects.length >= 1, effects.length);
 for (const dispose of effects) await dispose();

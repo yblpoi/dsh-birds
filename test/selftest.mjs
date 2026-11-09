@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { parseWav } from '../lib/audio/wav.mjs';
 import { resampleTo } from '../lib/audio/resample.mjs';
 import { planChunks, sliceChunk } from '../lib/audio/chunk.mjs';
@@ -22,6 +23,7 @@ import { configureFfmpeg, describeFfmpeg, localFfmpegPath, provisionedFfmpegPath
 import { formatProvisioning } from '../lib/format.mjs';
 import { bindLabels, chineseName, labelDigest, nameTableStatus, resetNameTables } from '../lib/names.mjs';
 import { parseBridgeEnvelope, quotedMediaNames, resolveQuotedMedia } from '../lib/im/quoted.mjs';
+import { uniqueByContent, fileDigest } from '../lib/im/duplicates.mjs';
 import { patchDshImSource, isPatched, UnsupportedBundleError, MARKER } from '../scripts/patch-dsh-im.mjs';
 
 const PKG_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -613,6 +615,49 @@ const mixed = filesOf(promote({ msgElements: [{ attachments: [
 ] }] }));
 check('two unnamed recordings are numbered apart', mixed.map((entry) => entry.name).join(',') === 'quoted-file-1.amr,quoted-file-2.amr', JSON.stringify(mixed));
 check('a quoted picture with no url is skipped', promote({ msgElements: [{ attachments: [{ filename: 'A.jpg', content_type: 'image/jpeg' }] }] }).length === 0);
+
+// ---- one photo delivered twice: identity is the content, not the path ----
+// A QQ photo reaches /birds through two independent routes: the Host attaches
+// its own content-addressed copy (basename = sha256 of the bytes), and dsh-im
+// stages the same bytes inside the session workspace under the platform file
+// name and announces that path in <dsh_im_files>. Both were recognised, so one
+// photo printed two identical `【1】`/`【2】` blocks. Reproduced with the exact
+// sha256 the phone reported (b1a65527…).
+const dupRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-dup-'));
+const dupBytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1024, 0x42), Buffer.from([0xff, 0xd9])]);
+const dupHash = createHash('sha256').update(dupBytes).digest('hex');
+const blobDir = path.join(dupRoot, 'attachments', 'v1', 'objects', dupHash.slice(0, 2));
+fs.mkdirSync(blobDir, { recursive: true });
+const blobPath = path.join(blobDir, dupHash);
+fs.writeFileSync(blobPath, dupBytes);
+const dupStagedDir = path.join(dupRoot, 'im', '.dsh-im', 'inbound', '20261109-114042-s2CIRC');
+fs.mkdirSync(dupStagedDir, { recursive: true });
+const stagedPath = path.join(dupStagedDir, '01-1-3D92.jpg');
+fs.writeFileSync(stagedPath, dupBytes);
+
+const dupLabels = new Map([[blobPath, '附件 ' + dupHash.slice(0, 8)], [stagedPath, '1-3D92.jpg']]);
+const deduped = await uniqueByContent([blobPath, stagedPath], { labels: dupLabels });
+check('one photo delivered twice collapses to one file', deduped.length === 1, JSON.stringify(deduped));
+check('the surviving copy keeps the readable name', deduped[0] === stagedPath, deduped[0]);
+check('the blob label follows the surviving copy', !dupLabels.has(blobPath) && dupLabels.has(stagedPath));
+
+const distinctA = path.join(dupStagedDir, '01-a.jpg');
+const distinctB = path.join(dupStagedDir, '02-b.jpg');
+fs.writeFileSync(distinctA, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from('A')]));
+fs.writeFileSync(distinctB, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from('B')]));
+const distinct = await uniqueByContent([distinctA, distinctB]);
+check('two different photos both survive', distinct.length === 2, JSON.stringify(distinct));
+
+const missing = path.join(dupStagedDir, '01-gone.jpg');
+const unreadable = await uniqueByContent([missing, distinctA], { logger: { warn: () => {} } });
+check('an unreadable file is kept rather than silently dropped', unreadable.length === 2, JSON.stringify(unreadable));
+
+const dedupeSingle = await uniqueByContent([stagedPath]);
+check('a single file passes through untouched', dedupeSingle.length === 1 && dedupeSingle[0] === stagedPath);
+const dedupeEmpty = await uniqueByContent([]);
+check('an empty list stays empty', Array.isArray(dedupeEmpty) && dedupeEmpty.length === 0);
+
+fs.rmSync(dupRoot, { recursive: true, force: true });
 
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);
