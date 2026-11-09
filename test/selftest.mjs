@@ -6,7 +6,7 @@ import { parseWav } from '../lib/audio/wav.mjs';
 import { resampleTo } from '../lib/audio/resample.mjs';
 import { planChunks, sliceChunk } from '../lib/audio/chunk.mjs';
 import { isoWeek, kindOf, sniffKind, classifyFile, isAttachmentBlob } from '../lib/recognize.mjs';
-import { formatImageResult, formatAudioResult, formatNonBirdResult, formatStatus } from '../lib/format.mjs';
+import { formatImageResult, formatAudioResult, formatNoBirdFound, formatNonBirdResult, formatStatus } from '../lib/format.mjs';
 import {
   BIRD_CLASS,
   COCO_CLASSES,
@@ -866,20 +866,20 @@ const uncroppedReply = formatImageResult({
   gate: { bird: true, cropped: false, score: 0.31 },
 });
 check('a bird too small to crop says the whole frame was used', /按整图识别/u.test(uncroppedReply), uncroppedReply);
-const unconfirmedReply = formatImageResult({
-  candidates: [{ chinese: '非洲鸵鸟', english: 'Common Ostrich', score: 0.817 }],
-  elapsedMs: 60, topK: 5, file: 't1.jpg',
-  gate: { bird: false, cropped: false, reason: 'no-detection' },
-});
-// The doubt has to be visible in the headline. A confident-looking ranked list
-// with a caveat underneath was read as a confirmed identification, which is the
-// exact complaint this branch exists to answer.
+// Nothing found is not an answer. The headline says the model does not know;
+// a ranked list of species under a hedge is exactly what got taken as a
+// confirmed identification before.
+const noBirdReply = formatNoBirdFound({ elapsedMs: 420, file: 'flower.jpg' });
 check(
-  'an unconfirmed species says so in the first line',
-  /^图片识别结果：前置模型没在这张图里检出鸟/u.test(unconfirmedReply),
-  unconfirmedReply,
+  'a frame with nothing in it says so in the first line',
+  /^图片识别结果：前置模型没在这张图里检出鸟/u.test(noBirdReply),
+  noBirdReply,
 );
-check('an unconfirmed species is labelled as a guess', /待验证的猜测/u.test(unconfirmedReply), unconfirmedReply);
+check('a frame with nothing in it admits it cannot name the subject', /也说不准画面里是什么/u.test(noBirdReply), noBirdReply);
+check('a frame with nothing in it offers no species', !/\d+\.\s/u.test(noBirdReply.split('判断依据')[0]), noBirdReply);
+check('a frame with nothing in it says the classifier was skipped', /没检出鸟就不调用识鸟模型/u.test(noBirdReply), noBirdReply);
+check('a frame with nothing in it says both passes were spent', /640/u.test(noBirdReply) && /960/u.test(noBirdReply), noBirdReply);
+check('a frame with nothing in it suggests what to do instead', /裁掉/u.test(noBirdReply) && /声音识别/u.test(noBirdReply), noBirdReply);
 check(
   'a confirmed bird reply keeps its model banner',
   /^图片识别结果（BirdTrace/u.test(croppedReply),
