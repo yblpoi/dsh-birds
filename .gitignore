@@ -20,6 +20,7 @@ Thumbs.db
 
 # 本地工具产物
 .codegraph/
+tmp-probe/
 
 # 本地私有配置
 .env
