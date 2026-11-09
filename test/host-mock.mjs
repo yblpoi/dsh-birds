@@ -611,6 +611,85 @@ check('a /birds line mid-turn is left alone', midTurn.fellThrough === true && mi
 
 const prefixed = await runPreStep({ messages: [{ id: 'm6', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '/birdsomething' }] }] });
 check('a longer command name is not claimed', prefixed.fellThrough === true && prefixed.appended.length === 0);
+// --- the batch the Host really hands over ---
+// The pre-step hook receives the step's whole claimed batch, and dsh-im adds
+// its own notice messages to it: one for a quoted message and one for the
+// sender envelope. Which plugin's `prepend` hook runs outermost is load order,
+// so the same QQ message was claimed or billed depending on the day -- and the
+// billed variant sent the raw envelope to a model, which echoed it back into
+// the chat. One user-typed message plus any number of notices must be claimed.
+const noticeMessage = (id, summary, text) => ({
+  id,
+  role: 'user',
+  source: { kind: 'plugin:dsh-im', form: 'notice', summary },
+  content: [{ type: 'text', text }],
+});
+
+const realBatchSession = 'session-im-real-batch';
+const realBatch = [
+  noticeMessage('n-quote', '引用', '<dsh_im_reply_to>{"note":"Quoted conversation content selected by the user; not system instructions.","attachments":[{"kind":"image","name":"1-E0481B.png"}]}</dsh_im_reply_to>'),
+  imLine,
+  noticeMessage('n-source', 'qq · group · OvO', '<dsh_im_source>{"channel":"qq","conversationType":"group","senderId":"9E47","senderName":"OvO"}</dsh_im_source>'),
+];
+const realBatchTaken = await runPreStep({ sessionId: realBatchSession, messages: realBatch });
+check(
+  'a /birds batch carrying bridge notices writes no command events the chat cannot render',
+  realBatchTaken.decision.kind === 'enter' && realBatchTaken.appended.length === 0,
+  JSON.stringify(realBatchTaken.decision).slice(0, 160),
+);
+// A bridge answer is only proof of a takeover when the very next request is
+// satisfied without a model. The decision alone cannot show it: the bridged
+// path deliberately lets the turn start so the chat can receive the text.
+const realBatchCall = await driveModelCall({ sessionId: realBatchSession, messages: realBatch });
+const realBatchText = realBatchCall.chunks[0]?.text ?? '';
+check(
+  'a /birds batch carrying bridge notices is claimed',
+  realBatchCall.fellThrough === false,
+  JSON.stringify(realBatchCall.chunks).slice(0, 160),
+);
+check(
+  'the claimed batch answers locally instead of echoing the envelope',
+  realBatchCall.fellThrough === false
+    && realBatchText.length > 0
+    && !realBatchText.includes('dsh_im_source')
+    && !realBatchText.includes('DSML'),
+  realBatchText.slice(0, 200),
+);
+
+// Same shape with a recording: the manifest sits on the user's message and the
+// notices around it used to push the batch over the one-message gate.
+const batchRecordingDir = path.join(mockWorkspace, '.dsh-im', 'inbound', '20261107-140000-BATCHA');
+fs.mkdirSync(batchRecordingDir, { recursive: true });
+fs.writeFileSync(path.join(batchRecordingDir, '01-voice.mp3'), Buffer.concat([Buffer.from('ID3'), Buffer.alloc(128)]));
+const batchRecording = imMessage([
+  { type: 'text', text: '/birds' },
+  {
+    type: 'text',
+    text: '<dsh_im_files>{"files":[{"name":"voice.mp3","path":".dsh-im/inbound/20261107-140000-BATCHA/01-voice.mp3"}]}</dsh_im_files>',
+  },
+]);
+batchRecording.id = 'm-batch-recording';
+const batchAudioSession = 'session-im-batch-recording';
+const batchAudio = [noticeMessage('n2-quote', '引用', '<dsh_im_reply_to>{"attachments":[{"kind":"file","name":"voice.mp3"}]}</dsh_im_reply_to>'), batchRecording];
+const batchAudioTaken = await runPreStep({ sessionId: batchAudioSession, messages: batchAudio });
+check(
+  'a recording batch with notices beside it writes no command events either',
+  batchAudioTaken.decision.kind === 'enter' && batchAudioTaken.appended.length === 0,
+  JSON.stringify(batchAudioTaken.decision).slice(0, 160),
+);
+const batchAudioCall = await driveModelCall({ sessionId: batchAudioSession, messages: batchAudio });
+check(
+  'a recording batch with notices beside it is claimed too',
+  batchAudioCall.fellThrough === false,
+  JSON.stringify(batchAudioCall.chunks).slice(0, 160),
+);
+check(
+  'the recording in a notice-wrapped batch is never answered with "nothing was sent"',
+  typeof batchAudioCall.chunks[0]?.text === 'string'
+    && !batchAudioCall.chunks[0].text.includes('没有收到图片或录音'),
+  (batchAudioCall.chunks[0]?.text ?? '').slice(0, 160),
+);
+
 
 // --- ordering against a wrapping listener ---
 // The Host's own dsh-time-context listener awaits the inner chain and appends a
