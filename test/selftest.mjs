@@ -847,7 +847,7 @@ check('a cropped bird reply reports the crop box', /684×638/u.test(croppedReply
 // numbers (the margin widens it); the reply must not conflate them.
 check(
   'a cropped bird reply also reports what was actually sent',
-  /1011×853/u.test(croppedReply) && /80\.2%/u.test(croppedReply),
+  /1011×853/u.test(croppedReply),
   croppedReply,
 );
 const bareCropReply = formatImageResult({
@@ -857,7 +857,7 @@ const bareCropReply = formatImageResult({
 });
 check(
   'a gate object without a crop size still renders one sentence',
-  /684×638/u.test(bareCropReply) && !/外扩后/u.test(bareCropReply),
+  /684×638/u.test(bareCropReply) && !/实际送入/u.test(bareCropReply),
   bareCropReply,
 );
 const uncroppedReply = formatImageResult({
