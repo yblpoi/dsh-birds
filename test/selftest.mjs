@@ -872,14 +872,19 @@ check('a bird too small to crop says the whole frame was used', /按整图识别
 const noBirdReply = formatNoBirdFound({ elapsedMs: 420, file: 'flower.jpg' });
 check(
   'a frame with nothing in it says so in the first line',
-  /^图片识别结果：前置模型没在这张图里检出鸟/u.test(noBirdReply),
+  /^图片识别结果：没检出鸟，也说不准画面里是什么/u.test(noBirdReply),
   noBirdReply,
 );
-check('a frame with nothing in it admits it cannot name the subject', /也说不准画面里是什么/u.test(noBirdReply), noBirdReply);
-check('a frame with nothing in it offers no species', !/\d+\.\s/u.test(noBirdReply.split('判断依据')[0]), noBirdReply);
-check('a frame with nothing in it says the classifier was skipped', /没检出鸟就不调用识鸟模型/u.test(noBirdReply), noBirdReply);
-check('a frame with nothing in it says both passes were spent', /640/u.test(noBirdReply) && /960/u.test(noBirdReply), noBirdReply);
+check('a frame with nothing in it offers no species', !/(^|\n)\d+\.\s/u.test(noBirdReply), noBirdReply);
 check('a frame with nothing in it suggests what to do instead', /裁掉/u.test(noBirdReply) && /声音识别/u.test(noBirdReply), noBirdReply);
+// The reply used to explain the two detection passes and why the classifier was
+// skipped; it read as a manual. Keep it to a headline, one advice line and the
+// usual footer so the answer fits on one screen.
+check(
+  'a frame with nothing in it stays short',
+  noBirdReply.split('\n').filter((line) => line.trim() !== '').length <= 4,
+  JSON.stringify(noBirdReply),
+);
 check(
   'a confirmed bird reply keeps its model banner',
   /^图片识别结果（BirdTrace/u.test(croppedReply),

@@ -53,7 +53,8 @@ dsh-birds 的 handler(invocation)
         ├─ 还是空 → formatNoBirdFound(...)  ← 不给物种，不调识鸟模型
         └─ 空结果不等于没有鸟（鸟太小 / 太远 / COCO 没有这一类），
            但让 10480 类的分类器硬猜只会得到一个看着很像的物种名，
-           所以这里承认「说不准画面里是什么」，并给出裁图重发 / 改声音识别两条路
+           所以这里承认「说不准画面里是什么」，用一行给出去路
+           （裁掉背景重发 / 改用声音识别），不写检测过程说明
 
 （情况①的完整链路：）
   ├─ ImageClassifier.classify(rgb)    ← onnxruntime-node 跑 model.onnx
@@ -330,12 +331,12 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 模型状态 | `/birdstatus` | 七个文件都是 ✓，推理引擎可用 |
 | 图片识别（有鸟） | `/birds` + 鸟照 | 返回 top-5 + 一行「已按…鸟框（W×H，占原图 P%）裁剪后再识别；送进识鸟模型的是外扩后的 W×H（占 P%）」，含「0 token」字样 |
 | 图片识别（无鸟） | `/birds` + 一张猫/苹果照 | 回「画面里没有检测到鸟」+「猫（cat）91.1%」这类内容，**不出现任何鸟种名** |
-| 图片识别（空画面） | `/birds` + 一张风景照 | 首行「前置模型没在这张图里检出鸟，也说不准画面里是什么」，**不调识鸟模型、不给任何物种**，改为给「裁掉背景重发」与「改用声音识别」两条建议 |
+| 图片识别（空画面） | `/birds` + 一张风景照 | 首行「图片识别结果：没检出鸟，也说不准画面里是什么」，**不调识鸟模型、不给任何物种**；正文只有一句「不猜物种。鸟太小可以裁掉背景再发，或用声音识别。」，**不出现 640/960 两遍检测的过程说明** |
 | 录音识别 | `/birds` + 3 秒以上鸟鸣 | 返回物种 + 时间段 + 命中段数 |
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 221 + 95 + 23 + 67 = 406 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 219 + 95 + 23 + 67 = 404 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | 引用语音回查 | 同上，但附件行是 `audio/amr`、引用条目只有 `{kind:'audio'}`（无 name），靠 `messageId` 查 | 仍能从历史库取回实体文件并嗅探为 audio；机器人没收到过的那条 → `unresolved`；无名的普通 file 不去瞎猜 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `Bs`/`N5e`/`D5e` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；下载器被改名后补丁跟着改名、找不到下载器时拒绝打补丁；引用图变成 image 并走平台白名单，引用语音变成 file 并走文件通道，无 filename 的录音补出可用后缀且编号不撞，重复/无 url/非白名单域名不搬 |
