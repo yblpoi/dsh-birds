@@ -6,7 +6,26 @@ import { parseWav } from '../lib/audio/wav.mjs';
 import { resampleTo } from '../lib/audio/resample.mjs';
 import { planChunks, sliceChunk } from '../lib/audio/chunk.mjs';
 import { isoWeek, kindOf, sniffKind, classifyFile, isAttachmentBlob } from '../lib/recognize.mjs';
-import { formatImageResult, formatAudioResult, formatStatus } from '../lib/format.mjs';
+import { formatImageResult, formatAudioResult, formatNonBirdResult, formatStatus } from '../lib/format.mjs';
+import {
+  BIRD_CLASS,
+  COCO_CLASSES,
+  COCO_ZH,
+  GATE_RETRY_SIZE,
+  GATE_SIZE,
+  GATE_WEAK_BIRD,
+  buildMask,
+  classLabel,
+  decodeOutput,
+  expandBox,
+  iou,
+  letterboxGeometry,
+  needsRetry,
+  nonMaxSuppression,
+  resolveGatePasses,
+  strongestBird,
+  unletterboxBox,
+} from '../lib/yologate.mjs';
 import { planChunks as pc } from '../lib/audio/chunk.mjs';
 import {
   USER_AGENT,
@@ -254,7 +273,7 @@ check('geo passes detections through when there is no gate', unapplied.applied =
 // "node scripts/download-models.mjs". Both are the plugin's own job now, and
 // the tables below are the contract every download is verified against.
 const models = modelTargets({});
-check('provisioning knows six model files', models.length === 6, String(models.length));
+check('provisioning knows seven model files', models.length === 7, String(models.length));
 check('every model pins a byte count and a sha256', models.every((target) => target.bytes > 0 && /^[0-9a-f]{64}$/.test(target.sha256)), JSON.stringify(models.map((t) => t.file)));
 check('every model has an https route', models.every((target) => target.urls.length >= 1 && target.urls.every((url) => url.startsWith('https://'))), JSON.stringify(models.map((target) => target.urls.length)));
 check('every model keeps a second route', models.every((target) => target.urls.length >= 2), JSON.stringify(models.map((target) => target.key + ':' + target.urls.length)));
@@ -294,7 +313,7 @@ check('ffmpeg links come from several hosts', linuxArm.urls.length >= 2 && new S
 const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-birds-provision-'));
 const empty = new Provisioner({ modelsDir: emptyDir, logger: { info() {}, warn() {} } });
 const emptyPlan = empty.plan();
-check('an empty models dir plans six downloads', emptyPlan.modelsMissing.length === 6, String(emptyPlan.modelsMissing.length));
+check('an empty models dir plans seven downloads', emptyPlan.modelsMissing.length === 7, String(emptyPlan.modelsMissing.length));
 check('an empty models dir also plans ffmpeg', emptyPlan.ffmpegMissing === true, String(emptyPlan.ffmpegMissing));
 check('an empty models dir is not ready', emptyPlan.ready === false, String(emptyPlan.ready));
 check('the plan totals the missing bytes', emptyPlan.missingBytes === models.reduce((sum, target) => sum + target.bytes, 0) + ffmpegTargetFor().bytes, mb(emptyPlan.missingBytes));
@@ -309,7 +328,7 @@ for (const target of models) {
 fs.mkdirSync(path.join(emptyDir, 'bin'), { recursive: true });
 fs.writeFileSync(ffmpegInstallPath(emptyDir), Buffer.alloc(0));
 const shortPlan = empty.plan();
-check('a truncated model is still missing', shortPlan.modelsMissing.length === 6, String(shortPlan.modelsMissing.length));
+check('a truncated model is still missing', shortPlan.modelsMissing.length === 7, String(shortPlan.modelsMissing.length));
 check('an empty ffmpeg placeholder is not ready', shortPlan.ffmpegMissing === true, String(shortPlan.ffmpegMissing));
 for (const target of models) fs.truncateSync(path.join(emptyDir, target.file), target.bytes);
 fs.writeFileSync(ffmpegInstallPath(emptyDir), Buffer.from('#!/bin/sh'));
@@ -658,6 +677,216 @@ const dedupeEmpty = await uniqueByContent([]);
 check('an empty list stays empty', Array.isArray(dedupeEmpty) && dedupeEmpty.length === 0);
 
 fs.rmSync(dupRoot, { recursive: true, force: true });
+
+// ---- The gate: YOLO26n-seg decides "bird or not" before BirdTrace is asked ----
+// BirdTrace is a 10480-way classifier with no "no bird here" output, so a photo
+// of a cat used to come back as a confident species. These checks pin the parts
+// of the gate that decide that answer: the label table, the letterbox round
+// trip, the raw-output decoder, NMS, the crop box, and the two reply shapes.
+check('the COCO label table covers all 80 detection classes', COCO_CLASSES.length === 80 && COCO_ZH.length === 80, COCO_CLASSES.length + '/' + COCO_ZH.length);
+check('class 14 is bird, which the whole feature hangs on', COCO_CLASSES[BIRD_CLASS] === 'bird' && COCO_ZH[BIRD_CLASS] === '鸟', classLabel(BIRD_CLASS));
+check('the gate runs at the resolution the COCO export was trained for', GATE_SIZE === 640, String(GATE_SIZE));
+check('the retry pass looks closer than the first pass', GATE_RETRY_SIZE === 960 && GATE_RETRY_SIZE > GATE_SIZE, String(GATE_RETRY_SIZE));
+// Real birds measured here score 0.70-0.91 even at a fraction of a percent of
+// the frame; the spurious bird hits that motivated this threshold sat at 0.30.
+check('a weak bird hit is below the trust threshold', GATE_WEAK_BIRD > 0.3 && GATE_WEAK_BIRD < 0.7, String(GATE_WEAK_BIRD));
+check('a class label pairs Chinese with English', classLabel(15) === '猫（cat）', classLabel(15));
+check('an out-of-range class still yields a label', classLabel(999) === 'class 999', classLabel(999));
+
+// Letterbox: a wide frame keeps its aspect ratio and is padded top and bottom.
+const wide = letterboxGeometry(640, 1280, 720);
+check('a 16:9 frame scales to full width', wide.drawnWidth === 640 && wide.drawnHeight === 360, JSON.stringify(wide));
+check('a wide frame is padded top and bottom only', wide.padTop === 140 && wide.padLeft === 0, JSON.stringify(wide));
+check('a landscape box keeps its scale', Math.abs(wide.scale - 0.5) < 1e-9, String(wide.scale));
+const tall = letterboxGeometry(640, 480, 960);
+check('a portrait frame is padded left and right', tall.padLeft === 160 && tall.padTop === 0, JSON.stringify(tall));
+
+// Round trip: a box expressed in letterbox pixels must come back to the same
+// source rectangle, otherwise the crop cuts the wrong part of the photograph.
+const srcBox = { x1: 200, y1: 100, x2: 700, y2: 500 };
+const back = unletterboxBox({
+  x1: srcBox.x1 * wide.scale + wide.padLeft,
+  y1: srcBox.y1 * wide.scale + wide.padTop,
+  x2: srcBox.x2 * wide.scale + wide.padLeft,
+  y2: srcBox.y2 * wide.scale + wide.padTop,
+}, { size: 640, srcWidth: 1280, srcHeight: 720 });
+check('letterbox boxes map back to source pixels', ['x1', 'y1', 'x2', 'y2'].every((k) => Math.abs(back[k] - srcBox[k]) < 1e-6), JSON.stringify(back));
+const bled = unletterboxBox({ x1: 0, y1: 0, x2: 640, y2: 640 }, { size: 640, srcWidth: 1280, srcHeight: 720 });
+check('a box bleeding into the padding is clamped to the frame', bled.x1 === 0 && bled.y1 === 0 && bled.x2 === 1280 && bled.y2 === 720, JSON.stringify(bled));
+
+// Cropping margin: wings and tails sit outside the detector's body box.
+const grown = expandBox({ x1: 100, y1: 100, x2: 300, y2: 200 }, { margin: 0.25, srcWidth: 1280, srcHeight: 720 });
+check('the crop box grows by the margin on every side', grown.x1 === 50 && grown.x2 === 350 && grown.y1 === 75 && grown.y2 === 225, JSON.stringify(grown));
+const pinned = expandBox({ x1: 10, y1: 10, x2: 90, y2: 90 }, { margin: 0.5, srcWidth: 100, srcHeight: 100 });
+check('a grown box never leaves the frame', pinned.x1 === 0 && pinned.y1 === 0 && pinned.x2 === 100 && pinned.y2 === 100, JSON.stringify(pinned));
+
+// Raw output: channel-major [4 + 80 + 32, anchors]. One anchor claiming bird at
+// 0.9 and one claiming cat at 0.8; everything else must stay silent.
+const ANCHORS = 4;
+const CHANNELS = 4 + COCO_CLASSES.length + 32;
+const raw = new Float32Array(ANCHORS * CHANNELS);
+const put = (row, anchor, value) => { raw[row * ANCHORS + anchor] = value; };
+put(0, 0, 320); put(1, 0, 320); put(2, 0, 100); put(3, 0, 100);
+put(4 + BIRD_CLASS, 0, 0.9);
+put(0, 1, 100); put(1, 1, 100); put(2, 1, 60); put(3, 1, 40);
+put(4 + 15, 1, 0.8);
+put(0, 2, 50); put(1, 2, 50); put(2, 2, 20); put(3, 2, 20);
+put(4 + BIRD_CLASS, 2, 0.10);
+put(4 + 16, 3, 0.05);
+const decoded = decodeOutput(raw, { anchors: ANCHORS, channels: CHANNELS, classCount: COCO_CLASSES.length }, { confidence: 0.25 });
+check('only anchors above the threshold survive decoding', decoded.length === 2, JSON.stringify(decoded.map((d) => [d.classIndex, d.score])));
+check('the decoded bird keeps its class and score', decoded.some((d) => d.classIndex === BIRD_CLASS && Math.abs(d.score - 0.9) < 1e-6), JSON.stringify(decoded.map((d) => d.classIndex)));
+check('a centre/size detection becomes corners', decoded.every((d) => d.x2 - d.x1 > 0 && d.y2 - d.y1 > 0), JSON.stringify(decoded.map((d) => [d.x1, d.y1, d.x2, d.y2])));
+check('every detection carries its mask coefficients', decoded.every((d) => d.maskCoeffs.length === 32), JSON.stringify(decoded.map((d) => d.maskCoeffs.length)));
+const stricter = decodeOutput(raw, { anchors: ANCHORS, channels: CHANNELS, classCount: COCO_CLASSES.length }, { confidence: 0.85 });
+check('raising the confidence drops the weaker anchor', stricter.length === 1 && stricter[0].classIndex === BIRD_CLASS, JSON.stringify(stricter.map((d) => d.classIndex)));
+
+// IoU and NMS: overlapping boxes of the same class collapse, other classes stay.
+check('iou of identical boxes is 1', Math.abs(iou({ x1: 0, y1: 0, x2: 10, y2: 10 }, { x1: 0, y1: 0, x2: 10, y2: 10 }) - 1) < 1e-9);
+check('iou of disjoint boxes is 0', iou({ x1: 0, y1: 0, x2: 10, y2: 10 }, { x1: 20, y1: 20, x2: 30, y2: 30 }) === 0);
+check('iou of a half-overlap is one third', Math.abs(iou({ x1: 0, y1: 0, x2: 10, y2: 10 }, { x1: 5, y1: 0, x2: 15, y2: 10 }) - 1 / 3) < 1e-9);
+const crowded = nonMaxSuppression([
+  { classIndex: BIRD_CLASS, score: 0.9, x1: 0, y1: 0, x2: 100, y2: 100 },
+  { classIndex: BIRD_CLASS, score: 0.8, x1: 2, y1: 2, x2: 102, y2: 102 },
+  { classIndex: BIRD_CLASS, score: 0.7, x1: 500, y1: 500, x2: 600, y2: 600 },
+  { classIndex: 15, score: 0.6, x1: 0, y1: 0, x2: 100, y2: 100 },
+]);
+check('nms merges duplicate boxes of one class', crowded.filter((d) => d.classIndex === BIRD_CLASS).length === 2, JSON.stringify(crowded.map((d) => d.score)));
+check('nms keeps a different class in the same place', crowded.some((d) => d.classIndex === 15), JSON.stringify(crowded.map((d) => d.classIndex)));
+check('nms returns the winners best-first', crowded[0].score === 0.9, JSON.stringify(crowded.map((d) => d.score)));
+
+
+// Which pass to believe. This rule is what stops a cat photo paying for a
+// second forward pass, and what stops a lizard (one spurious bird at 0.30 plus
+// an elephant at 0.56) being cropped and answered with a 15% species.
+const birdHit = (score, box = [0, 0, 100, 100]) => ({ classIndex: BIRD_CLASS, score, box: { x1: box[0], y1: box[1], x2: box[2], y2: box[3] } });
+const otherHit = (classIndex, score) => ({ classIndex, score, box: { x1: 0, y1: 0, x2: 10, y2: 10 } });
+const pass = (width, height, detections) => ({ sourceWidth: width, sourceHeight: height, detections });
+
+check('the strongest bird wins over a weaker one', strongestBird([birdHit(0.4), birdHit(0.8), birdHit(0.6)])?.score === 0.8);
+check('no bird means no strongest bird', strongestBird([otherHit(15, 0.9)]) === undefined);
+
+check('a confident bird needs no retry', needsRetry([birdHit(0.9)]) === false);
+check('an empty first pass deserves a retry', needsRetry([]) === true);
+check('a weak bird hit deserves a retry', needsRetry([birdHit(0.3)]) === true);
+// A cat is the load-bearing case: the first pass already has an answer, and a
+// retry spent confirming "not a bird" would slow down every non-bird upload.
+check('a frame full of non-birds needs no retry', needsRetry([otherHit(15, 0.91), otherHit(79, 0.48)]) === false);
+
+const firstStrong = resolveGatePasses({ first: pass(1200, 800, [birdHit(0.9)]) });
+check('a confident first pass is used as-is', firstStrong.bird?.score === 0.9 && firstStrong.sourceWidth === 1200, JSON.stringify(firstStrong.bird));
+const retryWins = resolveGatePasses({
+  first: pass(1200, 800, []),
+  second: pass(1600, 1200, [birdHit(0.73)]),
+});
+check('a bird found only by the retry brings the retry frame size', retryWins.bird?.score === 0.73 && retryWins.sourceWidth === 1600 && retryWins.sourceHeight === 1200, JSON.stringify(retryWins.sourceWidth));
+const weakOnly = resolveGatePasses({
+  first: pass(1200, 800, [birdHit(0.3), otherHit(20, 0.56)]),
+  second: pass(1200, 800, []),
+});
+check('a weak bird nobody confirms is discarded', weakOnly.bird === undefined);
+check('the objects the first pass saw survive the rejected bird', weakOnly.detections.length === 1 && weakOnly.detections[0].classIndex === 20, JSON.stringify(weakOnly.detections.map((d) => d.classIndex)));
+check('a rejected bird still reports the frame it was measured in', weakOnly.sourceWidth === 1200 && weakOnly.sourceHeight === 800);
+const weakBeatenByRetry = resolveGatePasses({
+  first: pass(1200, 800, [birdHit(0.3)]),
+  second: pass(1200, 800, [birdHit(0.72)]),
+});
+check('the retry can upgrade a weak hit into a real bird', weakBeatenByRetry.bird?.score === 0.72, JSON.stringify(weakBeatenByRetry.bird?.score));
+const bothEmpty = resolveGatePasses({ first: pass(1200, 800, []), second: pass(1200, 800, []) });
+check('two empty passes leave nothing to crop', bothEmpty.bird === undefined && bothEmpty.detections.length === 0);
+const retrySeesOthers = resolveGatePasses({
+  first: pass(1200, 800, [birdHit(0.3)]),
+  second: pass(1200, 800, [otherHit(15, 0.86)]),
+});
+check('when the retry sees objects and the first pass did not, they are kept', retrySeesOthers.detections.length === 1 && retrySeesOthers.detections[0].classIndex === 15, JSON.stringify(retrySeesOthers.detections.map((d) => d.classIndex)));
+
+// Masks: a single positive proto channel and a positive coefficient.
+const protos = new Float32Array(32 * 4);
+protos.fill(-1);
+protos[0] = 1; protos[1] = 1; // channel 0, first two pixels
+const coeffs = new Float32Array(32);
+coeffs[0] = 1;
+const mask = buildMask(coeffs, protos, { protoHeight: 2, protoWidth: 2 });
+check('a mask marks the pixels its protos select', mask.length === 4 && mask[0] === 1 && mask[1] === 1 && mask[2] === 0 && mask[3] === 0, Array.from(mask).join(','));
+
+// Reply shape for a non-bird photo: names what was found, never a species.
+const nonBird = formatNonBirdResult({
+  detections: [
+    { classIndex: 15, label: '猫（cat）', score: 0.911 },
+    { classIndex: 15, label: '猫（cat）', score: 0.7 },
+    { classIndex: 16, label: '狗（dog）', score: 0.5 },
+    { classIndex: 47, label: '苹果（apple）', score: 0.4 },
+  ],
+  elapsedMs: 61,
+  file: 'cat.jpg',
+  gate: { bird: false, cropped: false },
+});
+check('a non-bird reply says there is no bird', /没有检测到鸟/u.test(nonBird), nonBird.split('\n')[0]);
+check('a non-bird reply names the object it found', /猫（cat）/u.test(nonBird) && /91\.1%/u.test(nonBird), nonBird);
+check('a non-bird reply lists each class once', (nonBird.match(/猫（cat）/gu) ?? []).length === 1, nonBird);
+check('a non-bird reply stops at three classes', nonBird.split('\n').filter((line) => /^\d\. /u.test(line)).length === 3, nonBird);
+check('a non-bird reply never calls the model', /未调用大模型/u.test(nonBird), nonBird);
+const emptyFrame = formatNonBirdResult({ detections: [], elapsedMs: 12, file: 'x.jpg', gate: { bird: false, cropped: false } });
+check('an empty frame is reported as empty, not guessed', /没有在画面里找到任何可识别的物体/u.test(emptyFrame), emptyFrame);
+
+// A bird photo the gate cropped says so; one it could not crop admits the
+// whole frame was used; one it never confirmed warns the answer is a guess.
+const croppedReply = formatImageResult({
+  candidates: [{ chinese: '东黄鸲鹟', english: 'Eastern Yellow Robin', scientific: 'Eopsaltria_australis', score: 0.999 }],
+  elapsedMs: 594,
+  topK: 5,
+  file: 'bird1.jpg',
+  gate: {
+    bird: true, cropped: true, score: 0.906,
+    boxWidth: 684, boxHeight: 638, boxShare: 0.4,
+    cropWidth: 1011, cropHeight: 853, cropShare: 0.802,
+  },
+});
+check('a cropped bird reply reports the crop box', /684×638/u.test(croppedReply) && /40\.0%/u.test(croppedReply), croppedReply);
+// The bird box and the region actually handed to the classifier are different
+// numbers (the margin widens it); the reply must not conflate them.
+check(
+  'a cropped bird reply also reports what was actually sent',
+  /1011×853/u.test(croppedReply) && /80\.2%/u.test(croppedReply),
+  croppedReply,
+);
+const bareCropReply = formatImageResult({
+  candidates: [{ chinese: '东黄鸲鹟', english: 'Eastern Yellow Robin', score: 0.99 }],
+  elapsedMs: 300, topK: 5, file: 'b.jpg',
+  gate: { bird: true, cropped: true, score: 0.9, boxWidth: 684, boxHeight: 638, boxShare: 0.4 },
+});
+check(
+  'a gate object without a crop size still renders one sentence',
+  /684×638/u.test(bareCropReply) && !/外扩后/u.test(bareCropReply),
+  bareCropReply,
+);
+const uncroppedReply = formatImageResult({
+  candidates: [{ chinese: '麻雀', english: 'Eurasian Tree Sparrow', score: 0.7 }],
+  elapsedMs: 300, topK: 5, file: 'b.jpg',
+  gate: { bird: true, cropped: false, score: 0.31 },
+});
+check('a bird too small to crop says the whole frame was used', /按整图识别/u.test(uncroppedReply), uncroppedReply);
+const unconfirmedReply = formatImageResult({
+  candidates: [{ chinese: '非洲鸵鸟', english: 'Common Ostrich', score: 0.817 }],
+  elapsedMs: 60, topK: 5, file: 't1.jpg',
+  gate: { bird: false, cropped: false, reason: 'no-detection' },
+});
+// The doubt has to be visible in the headline. A confident-looking ranked list
+// with a caveat underneath was read as a confirmed identification, which is the
+// exact complaint this branch exists to answer.
+check(
+  'an unconfirmed species says so in the first line',
+  /^图片识别结果：前置模型没在这张图里检出鸟/u.test(unconfirmedReply),
+  unconfirmedReply,
+);
+check('an unconfirmed species is labelled as a guess', /待验证的猜测/u.test(unconfirmedReply), unconfirmedReply);
+check(
+  'a confirmed bird reply keeps its model banner',
+  /^图片识别结果（BirdTrace/u.test(croppedReply),
+  croppedReply,
+);
+const plainReply = formatImageResult({ candidates: [{ chinese: '鸟', english: 'bird', score: 0.5 }], elapsedMs: 10, topK: 5 });
+check('a reply without a gate says nothing about one', !/前置模型/u.test(plainReply), plainReply);
 
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURES');
 process.exit(failures === 0 ? 0 : 1);

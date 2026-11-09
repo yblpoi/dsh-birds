@@ -2,7 +2,7 @@
   "name": "dsh-birds",
   "version": "1.0.0",
   "type": "module",
-  "description": "DSH 本地鸟类识别插件：BirdTrace 图片识别 + BirdNET+ 声学识别 + Geomodel 地理先验，全程本机推理，不消耗 LLM token",
+  "description": "DSH 本地鸟类识别插件：YOLO26 前置门控（先判断是不是鸟、再按鸟框裁剪）+ BirdTrace 图片识别 + BirdNET+ 声学识别 + Geomodel 地理先验，全程本机推理，不消耗 LLM token",
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
@@ -19,6 +19,8 @@
     "bird",
     "birdnet",
     "onnxruntime",
+    "yolo",
+    "object-detection",
     "species-identification"
   ],
   "main": "./lib/index.js",

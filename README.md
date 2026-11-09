@@ -1,9 +1,10 @@
 # dsh-birds — DeepSeek Harness 本地鸟类识别插件
 
-在 **不调用任何大模型** 的前提下，用本机 CPU 跑两个识别模型：
+在 **不调用任何大模型** 的前提下，用本机 CPU 跑几个识别模型：
 
 | 输入 | 模型 | 类数 | 输出 |
 | --- | --- | --- | --- |
+| 图片（前置） | YOLO26n-seg（ONNX, 动态输入） | 80（COCO） | 画面里有没有鸟、鸟框在哪；不是鸟就说清是什么 |
 | 图片 | BirdTrace FastViT-MA36-10K（ONNX, FP32） | 10,480 | top-k 物种 + 相对置信度 |
 | 录音 | BirdNET+ V3.0 preview3.1 Global 11K（ONNX, FP16） | 11,000+ | 每个物种的最高分与时间段 |
 | 录音（可选） | BirdNET+ Geomodel V3.0.4 Global 14K（ONNX, FP16） | 14,082 | 按经纬度 + 周次筛掉不可能出现的物种 |
@@ -34,10 +35,11 @@ dsh-birds/
 ├── client.js                    浏览器半体：设置 → 插件 → dsh-birds 里的卡片（注入 / 还原 dsh-im 补丁）
 ├── lib/
 │   ├── index.js                 插件入口：注册 /birds 与 /birdstatus，可选的 Telegram 桥；另有 agent/pre-step 兜底（带附件的 /birds 不发给模型）
-│   ├── engine.mjs               三个模型的懒加载容器
+│   ├── engine.mjs               四个模型的懒加载容器（前置门控 + 识鸟 + 声学 + 地理）
 │   ├── ort.mjs                  onnxruntime-node 封装 + IEEE-754 float16 互转
 │   ├── paths.mjs                模型目录与文件名清单
-│   ├── imagedecode.mjs          图片 → 384×384 RGB（sharp，回退 ffmpeg）
+│   ├── imagedecode.mjs          图片解码：384×384 RGB / 640 letterbox / 按框裁剪（sharp，回退 ffmpeg）
+│   ├── yologate.mjs             YOLO26n-seg 前置门控：COCO 80 类检测 + NMS + 鸟框坐标还原
 │   ├── imageclf.mjs             BirdTrace 图片分类
 │   ├── audio/
 │   │   ├── wav.mjs              RIFF/WAVE 原生解析（8/16/24/32-bit PCM、32/64-bit float）
@@ -45,7 +47,7 @@ dsh-birds/
 │   │   ├── chunk.mjs            3 秒窗口切分（末块补零）
 │   │   └── birdnet.mjs          BirdNET+ 声学分类
 │   ├── geo.mjs                  Geomodel 地理先验（学名 join + 阈值硬过滤）
-│   ├── recognize.mjs            统一识别入口（命令与 IM 桥共用同一实现）
+│   ├── recognize.mjs            统一识别入口：先门控，再裁剪识别或直接报物体名（命令与 IM 桥共用）
 │   ├── names.mjs                中英对照名表加载（IOC 名录，按标签行号对齐 + 指纹校验）
 │   ├── names/                   随包分发的中文名表：image-zh.json / audio-zh.json
 │   ├── format.mjs               文本排版
@@ -100,6 +102,11 @@ ln -sfn ~/src/dsh-birds ~/.dsh/profiles/desktop/node_modules/dsh-birds
         modelsDir: ~/.dsh/models/bird
         topK: 5
         minConfidence: 0.15
+        # gateEnabled: true        # 可选，前置门控；设 false 退回整图识别
+        # gateConfidence: 0.25     # 可选，前置模型置信度阈值
+        # gateMargin: 0.25         # 可选，鸟框外扩比例
+        # gateMinBoxPx: 48         # 可选，框太小时不裁剪
+        # gateWeakBird: 0.5        # 可选，鸟分数低于此值就不算检出
         # geo:                     # 可选，配了就启用地理先验
         #   lat: 39.9042
         #   lon: 116.4074
@@ -136,7 +143,7 @@ npm install --force
 
 **不需要手动下载模型，也不需要 `apt install ffmpeg`。** 插件加载时会在后台自动完成这两件事：
 
-1. 把 6 个模型文件下到 `modelsDir`（默认 `~/.dsh/models/bird`）；
+1. 把 7 个模型文件下到 `modelsDir`（默认 `~/.dsh/models/bird`）；
 2. 把当前平台（linux/darwin/win32 × arm64/x64）的静态 ffmpeg 二进制下到 `<modelsDir>/bin/ffmpeg`——手机上的 PRoot 环境因此不需要包管理器。
 
 如果宿主机的 `PATH` 里本来就有可用的 `ffmpeg`，插件会直接借它，不再下这 50 MB 的自带副本（`/birdstatus` 会写明用的是哪一份）。自带副本始终优先，所以装过系统 ffmpeg 也不会改变解码行为。
@@ -166,6 +173,7 @@ node scripts/download-models.mjs
 
 | 文件 | 大小 | 来源 |
 | --- | --- | --- |
+| `yolo26n-seg.onnx` | 11,502,743 B | `https://hf-mirror.com/unileon-robotics/YOLO26-ONNX/resolve/main/dynamic/yolo26n-seg.onnx` |
 | `BirdTrace-FastViT-MA36-10K.onnx` | 222,385,590 B | `https://hf-mirror.com/warden123/BirdTrace-FastViT-MA36-10K/resolve/main/model.onnx` |
 | `BirdTrace-FastViT-MA36-10K.classes.json` | 1,000,770 B | 同上 `classes.json` |
 | `BirdNET+_V3.0-preview3.1_Global_11K_FP16_pruned.onnx` | 71,528,628 B | `https://zenodo.org/records/20703646/files/…?download=1` |
@@ -213,6 +221,53 @@ node scripts/download-models.mjs --check
 共 2 个 3 秒窗口（6.0 s）｜耗时 2.41 s｜未调用大模型｜0 token
 名称：中文名（English）对照；未收录的类群（昆虫、蛙类等）显示英文名与学名。
 ```
+
+### 图片识别有三种回法
+
+图片会先进一个前置门控模型（YOLO26n-seg，COCO 80 类），由它决定后面怎么走：
+
+**① 画面里有鸟 → 按鸟框裁剪后再识鸟**（鸟在图里占比越大，识别越准）：
+
+```
+图片识别结果（BirdTrace FastViT-MA36 · 10480 类 · 本地推理）
+
+1. 东黄鸲鹟（Eastern Yellow Robin）　99.9%
+2. 西黄鸲鹟（Western Yellow Robin）　0.1%
+...
+
+耗时 0.26 s｜未调用大模型｜0 token
+已按前置模型 YOLO26n-seg 检出的鸟框（684×638，占原图 40.0%）裁剪后再识别；送进识鸟模型的是外扩后的 1011×853（占 79.0%）；画面里确有 bird 类，置信度 90.6%。
+```
+
+**② 画面里没有鸟，但有别的东西 → 直接回答那是什么**，不调用鸟类模型（这是为了不让它把一只猫硬认成某种鸟）：
+
+```
+图片识别结果：画面里没有检测到鸟
+
+识别到的内容：
+1. 猫（cat）　91.1%
+
+耗时 0.06 s｜未调用大模型｜0 token
+判断依据：前置模型 YOLO26n-seg 的 COCO 80 类检测；未检出 bird 类时才给出这个结论。
+COCO 只有 80 个常见类别，老虎、狐狸、麻雀以外的多数物种会被归到最接近的一类（例如猫科归为 cat）。
+如果你确定画面里有鸟（比如鸟太小或只露出局部），可以裁一裁再发，或改用声音识别。
+```
+
+**③ 前置模型什么也没找到 → 仍然给出物种，但首行就写明这是猜测**。零检出并不等于没有鸟（鸟可能太小、太远，或 COCO 没有对应的类），所以不直接拒绝，而是照常识别 —— 但「未经确认」写在第一行，不写在最后一行：
+
+```
+图片识别结果：前置模型没在这张图里检出鸟，以下物种是整图猜测，未经确认
+
+1. 非洲鸵鸟（Common Ostrich）　81.7%
+...
+提示：前置模型 YOLO26n-seg 在这张图里没有检出任何物体（鸟可能太小、太远或只露出局部），
+上面的物种是把整图直接送进识鸟模型得到的，没有经过鸟框裁剪，请当作待验证的猜测。
+如果你确定画面里有鸟，可以裁掉多余背景再发，或改用声音识别。
+```
+
+早先的版本把「请当作待验证的猜测」放在最后一行，headline 仍是「图片识别结果（BirdTrace…）」，读起来像一次确定的识别 —— 一张虞美人花田的照片会被答成「圭亚那冠伞鸟 97.5%」。把限定语挪到首行之后，同样的排名仍然给出，但对话里第一眼看到的就是「没检出鸟、这是猜测」。
+
+裁剪用的框会先按 `gateMargin`（默认 0.25，即四周各留 25%）外扩，避免把鸟的喙、尾羽切掉 —— 所以回复里分开写两件事：**鸟框**是检测器量到的鸟本身（684×638，占原图 40.0%），**送进识鸟模型的**是外扩并裁到画面边界之后的区域（1011×853，占 79.0%）。只看前者会以为切得很紧，实际喂进去的画面比鸟大一圈。框太小（短边小于 `gateMinBoxPx`，默认 48 px）时不做裁剪 —— 把 20 px 的鸟放大到 384 px 只会喂给分类器一堆插值出来的假细节，这时整图反而是更好的输入。
 
 命令的 `input` 声明了 `attachments: true`，所以 DSH 会把附件经 `@deepseek-ai/dsh-attachment` 存储后传给你；插件用 `ctx.get('attachments').imageHostPath(ref)` / `fileHostPath(ref)` 拿到 Host 侧绝对路径再喂给模型。
 
@@ -366,6 +421,35 @@ dsh-im 为了自己记群聊，会把收到的消息写进 `~/.dsh/integrations/
   → 本插件默认复刻硬过滤（`lib/geo.mjs` 的 `allowedSpecies` + `filterByAllowedSpecies`），按**学名** join。
 - 没配 `geo`、或模型文件缺失时，**静默跳过**，纯声学结果照常返回。
 
+### YOLO26n-seg（前置门控）
+
+只做一件事：判断画面里有没有鸟、鸟在哪。规格同样来自对 ONNX 文件的实际解析：
+
+- 来源 `unileon-robotics/YOLO26-ONNX` 的 `dynamic/yolo26n-seg.onnx`（11.0 MB，sha256 `66d14cf6…`，下载后按字节数和哈希双校验）。
+- 输入 `images`：`float32 [1, 3, H, W]`，**H/W 是动态维**（不是固定 640，这正合我们的需要）。
+- 输出两个：`output0` `[1, 4+80+32, anchors]`（框 + 80 类分数 + 32 个遮罩系数）、`output1` `[1, 32, 160, 160]`（原型遮罩）。
+  640 输入时锚点 8400 个。**注意布局是通道优先**（`output0[(4+c)*anchors + a]`），不是 YOLOv8 某些导出里的锚点优先。
+- 预处理：letterbox 到正方形（灰底 `114`，不是黑边也不是白边），**只做 /255**，无 mean/std。
+- 类别表是 COCO 80 类，鸟是第 **14** 类。中文名写在 `lib/yologate.mjs` 里，不走外部文件。
+- 后处理：按类做 NMS（IoU 0.45），置信度阈值默认 0.25。
+- **两段式分辨率**：先按 640 跑；只有当这一遍**没有一只值得信的鸟**时，才用 960 再跑一遍（`GATE_RETRY_SIZE`）。「不值得信」有两种：一个目标都没检出，或者检出的鸟分数低于 `GATE_WEAK_BIRD`（0.5）。实测在一张 1600×1200 的图里，640 能抓到占画面宽度 19% 以上的鸟、漏掉 10% 的；960 能抓到那个 10% 的；再往上到 1280 没有多抓到鸟，只是更慢。空结果恰好就是过去会被硬认成某种鸟的那类图，所以第二次只花在这里：代价是约 120 ms，且只在「本来就没答案」的图上付。一张猫的照片不会触发它 —— 第一遍已经把话说完了，为确认「不是鸟」再跑一遍会拖慢每一次非鸟类上传。
+- **弱鸟不算鸟**：640 会把一只蜥蜴误报成 `bird 0.30`，那一遍还同时说了 `elephant 0.56`。这种分数既不足以裁剪（裁出来是 15% 置信度的物种），也不足以在「这不是鸟」的回复里声称画面里有鸟，所以两遍都弱时把 bird 类丢掉。丢掉 bird 之后**保留**这一遍检出的其它物体 —— 继续按 960 看反而会把小物体一起看丢（同一张蜥蜴图 960 是零检出），所以「有没有鸟」这件事听 960 的，「画面里还有什么」这件事听看得见的那一遍。
+- 门控失败（模型没下好、解码抛错）不会中断识别：记一条警告，退回整图识别，回复里不带门控那几行。
+- **试过更大的模型，仍然选 n**。`yolo26s-seg`（42.2 MB）在 640 就能抓到 n 需要 960 才抓到的小鸟，分数也普遍更高；但非鸟图片从 92 ms 涨到 166 ms（1.8×）、普通鸟图从 335 ms 涨到 421 ms，权重体积和常驻内存都是 3.7×，而且把小到 48 px 的鸟误报成「书（book）」——正好破坏「不是鸟就报物体名」的准确性。960 重跑只贵在本来就没答案的图上，s 则贵在每一张上。
+- 分割输出目前**没有**用来做像素级抠图 —— 裁剪用的是检测框。32 个遮罩系数和原型遮罩已经解码进 `detect()` 的返回值并加了单元测试，将来要做「只留鸟、背景涂黑」时接上即可。
+
+可调的五个参数（命令与 IM 桥同一套）：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `gateEnabled` | `true` | 关掉就退回 1.0 的行为：整图直接送识鸟模型 |
+| `gateConfidence` | `0.25` | 前置模型置信度阈值，调高更保守 |
+| `gateWeakBird` | `0.5` | 鸟分数低于此值就不裁剪、也不声称画面里有鸟（并触发 960 复看） |
+| `gateMargin` | `0.25` | 裁剪框四周外扩比例，防止切掉喙和尾羽 |
+| `gateMinBoxPx` | `48` | 框短边小于此值就不裁剪（放大只会造假细节） |
+
+手机上的内存代价很小：权重 11 MB，640 前向约 0.06 s、960 约 0.15 s（桌面 M 系列的实测，手机上按比例放大）。
+
 ---
 
 ## 6. 在 Android（DSH Go）上部署
@@ -382,9 +466,9 @@ node -v             # 期望 v22.19 以上
 #    DSH Go 的 profile 目录名是 web（桌面端通常是 desktop），先 ls ~/.dsh/profiles 确认
 cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 
-# 3) 重启 DSH：模型（约 250 MB）和静态 ffmpeg（约 50 MB）会自己下好
+# 3) 重启 DSH：模型（约 301 MB）和静态 ffmpeg（约 50 MB）会自己下好
 #    /birdstatus 里能看到进度，不需要 apt，也不需要跑脚本
-# 4) /birdstatus 检查，看到 6 个 ✓ 和 ffmpeg 一行就绪即可
+# 4) /birdstatus 检查，看到 7 个 ✓ 和 ffmpeg 一行就绪即可
 ```
 
 ### 真机上的性能与内存
@@ -396,11 +480,12 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 | 图片模型常驻内存 | 约 212 MB 权重 + 中间激活；一次 384×384 前向在这台机器上约 1.0 s |
 | 声学模型常驻内存 | 约 30–50 MB；每个 3 秒窗口约 0.4 s |
 | Geomodel | 约 8 MB，一次前向约 0.07 s |
-| 三个模型全部 createSession | 约 0.8 s |
+| 前置门控（YOLO26n-seg） | 权重 11 MB；640 前向约 0.06 s，960 重跑约 0.15 s |
+| 四个模型全部 createSession | 约 1.0 s |
 | `/birds` 音频端到端（3 s WAV） | 约 0.6 s（含 WAV 解析、分块、声学推理、地理先验、排版） |
 | 并发线程 | 默认 `intraOpNumThreads: 2`，避免 PRoot 里把 CPU 打死；可调 |
 
-两个模型都是**首次用到才加载**（`lib/engine.mjs`），插件卸载时 `release()` 释放。手机上如果内存吃紧，把 `maxAudioSeconds` 调小（默认 600 秒）。
+四个模型都是**首次用到才加载**（`lib/engine.mjs`），插件卸载时 `release()` 释放。手机上如果内存吃紧，把 `maxAudioSeconds` 调小（默认 600 秒）。
 
 ### 已知风险（先看这里再排查）
 
@@ -421,13 +506,13 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 ## 7. 自测
 
 ```bash
-node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / 下载清单与 ffmpeg 查找顺序 / 引用附件回查 / dsh-im 补丁变换
+node test/selftest.mjs    # WAV 解析 / 重采样 / 分块 / ISO 周 / 中英对照排版 / 名表指纹 / 地理先验门控 / YOLO 门控（COCO 标签、letterbox、NMS、框还原、遮罩、排版）/ 下载清单与 ffmpeg 查找顺序 / 引用附件回查 / dsh-im 补丁变换
 node test/host-mock.mjs   # 用 mock ctx 验证命令注册、handler 契约、pre-step 接管（含 QQ 形态的包装消息、引用图片、引用语音、桥接暂存的录音）、llm/stream 交付、生命周期
 node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路径
 node test/settings.mjs    # 设置卡：三条路由的守卫 / 打补丁 / 还原 + 浏览器半体的槽位与文案
 ```
 
-在 Node.js v22+ 上 `selftest` 155 项 + `hosttest` 77 项 + `imports` 21 项 + `settings` 67 项，共 320 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 217 项 + `hosttest` 95 项 + `imports` 23 项 + `settings` 67 项，共 402 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 

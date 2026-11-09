@@ -18,6 +18,9 @@ models/
 .DS_Store
 Thumbs.db
 
+# 本地工具产物
+.codegraph/
+
 # 本地私有配置
 .env
 .env.*

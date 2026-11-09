@@ -20,6 +20,12 @@
         overlapSeconds: 0
         # 单个录音最多分析多少秒，超出的部分丢弃
         maxAudioSeconds: 600
+        # 图片前置门控（YOLO26n-seg）。gateEnabled: false 退回「整图直接识鸟」的老行为。
+        # gateEnabled: true
+        # gateConfidence: 0.25
+        # gateWeakBird: 0.5
+        # gateMargin: 0.25
+        # gateMinBoxPx: 48
         # 可选：地理先验（Geomodel）。不填就只用声学结果。
         # geo:
         #   lat: 39.9042

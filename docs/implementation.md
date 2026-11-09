@@ -12,7 +12,7 @@
 1. **定位了第一层扩展点**：DSH 内核自带人类命令注册表 `ctx.commands.register`（`@deepseek-ai/dsh-commands`），命令 handler 直接返回文本，**整个执行过程不启动 agent 回合**。
 2. **发现注册表有覆盖不到的入口**：注册表只管**客户端主动路由过来的行**。DSH Go 的 composer 在带附件时整行当普通 prompt 投给 `session/prompt`（`chat_screen.dart:486-493`），服务端 prompt 不做命令路由，于是 `/birds` + 照片仍会进 LLM。补一层回合边界钩子 `agent/pre-step` 兜底（见 §2.1）。
 3. **否掉了「让 dsh-im 帮忙路由命令」的路子**：`@xmanrui/dsh-im` 5.10.0 没有本地命令扩展点，带图片的消息一定进 LLM（见 §3 证据）；只有「引用附件」这一处另打了补丁（`scripts/patch-dsh-im.mjs`，见 §2.2），命令路由本身仍靠宿主钩子。
-4. **写出了完整插件** `dsh-birds`：图片走 BirdTrace FastViT-MA36，声音走 BirdNET+ V3 11K，地理先验走 Geomodel V3.0.4，三者都在本机 ONNX Runtime 里跑。
+4. **写出了完整插件** `dsh-birds`：图片先过 YOLO26n-seg 门控（判断是不是鸟、鸟框在哪），再走 BirdTrace FastViT-MA36；声音走 BirdNET+ V3 11K；地理先验走 Geomodel V3.0.4。四者都在本机 ONNX Runtime 里跑。
 
 ---
 
@@ -30,11 +30,33 @@ DSH 内核 commands 服务
   ▼
 dsh-birds 的 handler(invocation)
   ├─ invocation.attachments[i].attachment  →  ctx.get('attachments').imageHostPath(ref)
-  ├─ decodeImageToRgb(file, 384)      ← sharp，缺失时回退 ffmpeg
+  ├─ decodeImageLetterbox(file, 640)  ← sharp，缺失时回退 ffmpeg
+  ├─ BirdGate.detect(rgb)             ← YOLO26n-seg，COCO 80 类
+  │     输入 [1,3,640,640] float32，只 /255（无 mean/std）
+  │     输出 → NMS → 鸟框坐标还原到原图像素
+  │
+  ├─ 情况①：检出了 bird 类（且框短边 ≥ 48 px）
+  │     ├─ expandBox(框, 0.25)        ← 四周留 25%，别切掉喙和尾羽
+  │     ├─ decodeImageCrop(file, 框, 384)
+  │     ├─ ImageClassifier.classify(crop)   ← 只把鸟框送进识鸟模型
+  │     ├─ formatImageResult({ gate })      ← 尾部写明裁剪来源
+  │     └─ return { kind: 'success', text }
+  │
+  ├─ 弱鸟（bird 分数 < GATE_WEAK_BIRD 0.5）视为没检出
+  │     └─ 丢掉 bird 类，其它物体保留，按情况② 处理
+  │
+  ├─ 情况②：没检出 bird，但检出了别的东西
+  │     └─ formatNonBirdResult(...)   ← 直接回答「猫 / 苹果」，不调识鸟模型
+  │
+  └─ 情况③：640 既没检出别的目标、也没有值得信的鸟
+        ├─ 用 960 重跑一次（GATE_RETRY_SIZE）
+        ├─ 还是空 → 整图送分类器，首行就写明「以下物种是整图猜测，未经确认」
+        └─ 空结果不等于没有鸟（鸟太小 / 太远 / COCO 没有这一类）
+
+（情况①的完整链路：）
   ├─ ImageClassifier.classify(rgb)    ← onnxruntime-node 跑 model.onnx
   │     输入 [1,3,384,384] float32，值域 [0,1]（图内已内嵌 mean/std）
   │     输出 visual_logits → softmax → top-5
-  ├─ formatImageResult(...)           ← 拼中文文本
   └─ return { kind: 'success', text }
         │
         ▼
@@ -206,6 +228,48 @@ keyed 槽的 key 是共享命名空间，**同一个 key 注册两次会抛错**
 
 > **踩过的坑：tensor dims 不能写 `null`**。图里 batch 是 symbolic 的，所以最初按图声明传了 `[null, 3]`，结果 onnxruntime-node 直接抛 `TypeError: dims[0] must be an integer, got: null`。因为 `recognize.mjs` 用 try/catch 包住地理先验（失败只 warn），这个错误会**静默吞掉整个地理过滤**。现在固定传 `[1, 3]`，并在 `test/selftest.mjs` 里加了断言钉死形状。
 
+### 4.4 YOLO26n-seg（图片前置门控）
+
+存在的理由：BirdTrace 的输出层是 10480 路 softmax，**没有「以上都不是」这一项**。随便喂一张风景照，它也一定会在花丛里挑出置信度最高的那种鸟。所以「这图里到底有没有鸟」必须由另一个模型回答。
+
+| 项 | 值 |
+| --- | --- |
+| 来源 | `unileon-robotics/YOLO26-ONNX` → `dynamic/yolo26n-seg.onnx` |
+| 体积/校验 | 11,502,743 B，sha256 `66d14cf6d2fbf5e4eca3b98cbfb13ca7141931f74830261038f2fb9dc848b41c` |
+| 输入 | `images`，float32 `[1, 3, H, W]`，**H/W 为动态维**（导出名为 `dynamic`，不是固定 640） |
+| 输出 | `output0` `[1, 4+80+32, anchors]`；`output1` `[1, 32, 160, 160]`（原型遮罩） |
+| 布局 | **通道优先**：`output0[(4 + c) * anchors + a]`。某些 YOLOv8 导出是锚点优先，照抄会全错 |
+| 预处理 | letterbox 到正方形，灰底 **114**（YOLO 惯例，不是黑边也不是白边），**只 /255**，无 mean/std |
+| 类别 | COCO 80 类，鸟 = 第 **14** 类；中文名内置在 `lib/yologate.mjs` |
+| 后处理 | 分类别 NMS（IoU 0.45），置信度阈值默认 0.25 |
+| 许可 | **AGPL-3.0（Ultralytics）**；插件只做 ONNX 推理，不打包权重，运行时从 HF 下载 |
+
+**两段式分辨率。** 实测（1600×1200 的图，把鸟按不同宽度贴进去）：
+
+| 输入尺寸 | 能抓到的鸟宽 | 单次前向 |
+| --- | --- | --- |
+| 640 | ≥ 19% 画面宽 | 约 0.06 s |
+| 960 | ≥ 10% 画面宽 | 约 0.15 s |
+| 1280 | 同 960，没多抓到 | 约 0.27 s |
+
+直接全局改成 960 会让**每一张**图都慢一倍多，而大多数照片里鸟都够大。所以：先跑 640，**只有这一遍没有一只值得信的鸟**时才用 960 重跑。「不值得信」有两种：一个目标都没检出，或者检出的鸟分数低于 `GATE_WEAK_BIRD`。空结果恰好就是过去会被硬认成某种鸟的那类图，第二次的代价只花在「本来就没答案」的地方。一张猫的照片不会触发重跑 —— 第一遍已经把话说完了。
+
+**为什么不用更大的 s 版本。** 既然 640 漏掉的鸟要靠 960 补，很自然会想到换一个更强的模型（`yolo26s-seg`，同一仓库的 42.2 MB 版本）。实测它确实更灵：640 就能抓到 n 要 960 才抓得到的 10% 小鸟（`share-160.jpg` 0.713 vs 无检出），分数也普遍高 0.02–0.15。但代价是**每一次上传都要付**：(1) 非鸟图片平均 166 ms vs 92 ms（1.8×），普通鸟图 421 ms vs 335 ms（1.26×）；(2) 权重 42 MB vs 11.5 MB，下载和常驻内存都是 3.7×，手机上这比多跑一遍 960 贵得多；(3) 它带来一个新的误报模式 —— 48 px 的小鸟被认成 `书（book）` 0.59，而 n 在那张图上什么都不说，正好破坏「非鸟就报物体名」这条的准确性。所以默认仍是 n：960 重跑只花在「本来就没答案」的那部分图上，而 s 要每一张都慢。
+
+**弱鸟不算鸟。** 实测里 640 把一只蜥蜴误报成 `bird 0.30`（同一遍还说 `elephant 0.56`）。这个分数既不够裁剪（裁出来是 15% 置信度的物种），也不该出现在「这不是鸟」的回复里。真实鸟类即便只占画面千分之四，分数也有 0.70 以上，所以 `GATE_WEAK_BIRD = 0.5` 划在两个人群之间。两遍都弱就丢掉 bird 类。
+
+**丢掉 bird 之后保留别的东西。** 「继续按 960 看」会把小物体一起看丢（同一张蜥蜴图在 960 是零检出），所以分工很明确：「有没有鸟」听 960 的，「画面里还有什么」听看得见的那一遍。
+
+**为什么裁剪框要外扩。** 检测框通常只框住鸟的躯干，喙尖和尾羽容易落在框外；直接按框裁，送进分类器的图会缺零件。`expandBox` 默认四周各扩 25%，并裁到原图边界内。
+
+外扩之后，「鸟有多大」和「喂进去的是什么」就是两个数了，所以 `gate` 里分开记：`boxWidth/boxHeight/boxShare` 是检测器量到的鸟本身，`cropWidth/cropHeight/cropShare` 是 `decodeImageCrop` 真正切出来送进 BirdTrace 的区域。回复里两个都写（鸟框 684×638 占 40.0%｜送进去的是外扩后的 1011×853 占 79.0%）：只写前者会让人以为切得很紧，而实际画面比鸟大一圈，这关系到该怎么调 `gateMargin`。
+
+**为什么框太小就不裁。** 短边小于 `gateMinBoxPx`（默认 48 px）时不做裁剪：把 20 px 的鸟双三次插值到 384 px，喂给分类器的是一堆编造出来的细节，比整图还不如。这种情况走整图，回复里如实写明。
+
+**分割头目前没用来抠图。** `output1` 的 32 个遮罩系数已解码进 `detect()` 的返回值（`buildMask` + 单测），但裁剪用的是检测框。要做「只留鸟、背景涂黑」时接上即可。
+
+**失败必须软着陆。** 门控整段包在 try/catch 里：模型没下好、解码抛错，都只记一条 `前置门控失败，改为整图识别` 警告，然后退回 1.0 的行为（整图识别，回复里不带门控那几行）。
+
 ---
 
 ## 5. Android / DSH Go 部署步骤
@@ -226,14 +290,14 @@ npm install github:yblpoi/dsh-birds      # 从仓库装进 node_modules/dsh-bird
 #         name: dsh-birds
 #         config: { modelsDir: ~/.dsh/models/bird }
 
-# ③ 重启 DSH：模型（约 250 MB）与静态 ffmpeg（约 50 MB）由插件自动下载，
+# ③ 重启 DSH：模型（约 301 MB）与静态 ffmpeg（约 50 MB）由插件自动下载，
 #    进度看 /birdstatus；不需要手动跑脚本
 #    宿主机 PATH 里已有 ffmpeg 时只补模型，不再下那 50 MB 自带副本
 #    Geomodel 只在 GitHub Releases 上，某些移动网络直连会连续超时，
 #    因此它额外挂了 https://gh-proxy.com/<原地址> 中转线路（同一份字节，校验不变）
 
 # ④ 在会话里敲（两个命令都应出现在命令面板里）
-/birdstatus          # 六个模型文件与推理引擎状态
+/birdstatus          # 七个模型文件与推理引擎状态
 /birds               # 附带图片或录音，本机识别
 ```
 
@@ -261,13 +325,15 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 检查 | 命令 | 期望 |
 | --- | --- | --- |
 | 命令注册 | 会话里输入 `/` | 出现 `birds`、`birdstatus` |
-| 模型状态 | `/birdstatus` | 六个文件都是 ✓，推理引擎可用 |
-| 图片识别 | `/birds` + 鸟照 | 返回 top-5，含「0 token」字样 |
+| 模型状态 | `/birdstatus` | 七个文件都是 ✓，推理引擎可用 |
+| 图片识别（有鸟） | `/birds` + 鸟照 | 返回 top-5 + 一行「已按…鸟框（W×H，占原图 P%）裁剪后再识别；送进识鸟模型的是外扩后的 W×H（占 P%）」，含「0 token」字样 |
+| 图片识别（无鸟） | `/birds` + 一张猫/苹果照 | 回「画面里没有检测到鸟」+「猫（cat）91.1%」这类内容，**不出现任何鸟种名** |
+| 图片识别（空画面） | `/birds` + 一张风景照 | 首行改为「前置模型没在这张图里检出鸟，以下物种是整图猜测，未经确认」，仍给 top-5，尾部再附「提示：…没有检出任何物体…请当作待验证的猜测」 |
 | 录音识别 | `/birds` + 3 秒以上鸟鸣 | 返回物种 + 时间段 + 命中段数 |
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 155 + 77 + 21 + 67 = 320 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 217 + 95 + 23 + 67 = 402 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | 引用语音回查 | 同上，但附件行是 `audio/amr`、引用条目只有 `{kind:'audio'}`（无 name），靠 `messageId` 查 | 仍能从历史库取回实体文件并嗅探为 audio；机器人没收到过的那条 → `unresolved`；无名的普通 file 不去瞎猜 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `Bs`/`N5e`/`D5e` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；下载器被改名后补丁跟着改名、找不到下载器时拒绝打补丁；引用图变成 image 并走平台白名单，引用语音变成 file 并走文件通道，无 filename 的录音补出可用后缀且编号不撞，重复/无 url/非白名单域名不搬 |
@@ -283,12 +349,13 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 
 ## 7. 已知限制
 
-1. BirdTrace **不判断「画面里有没有鸟」**，它永远给 10480 类里的 top-k。拍只猫也会得到一个「最像的鸟」。
+1. **「画面里有没有鸟」已由前置门控回答，但这个回答有边界。** YOLO26n-seg 只认 COCO 80 类，且对小于画面宽度约 10%（960 重跑后）的目标无能为力。所以真正的小目标、COCO 之外的类群（蜥蜴、蝴蝶、花卉）、以及大面积遮挡，仍会落到「零检出 → 整图识别 + 待验证提示」这条路。门控判为「不是鸟」时，回答的是 COCO 的粗类名（猫科一律是 cat，不会细分到种）。
+   门控的「不是鸟」结论同样会错：一只鸟被画成风筝、一张鸟的插画、一堆羽毛特写，都可能被判成 COCO 的其他类。回复里因此保留了「如果你确定画面里有鸟，可以裁一裁再发」的兜底建议。
 2. BirdNET+ V3 是 **Developer Preview**，官方明说物种表待清理、不检测人声、对雨/风/引擎鲁棒性有限。
 3. 分数**不是校准概率**；同一物种在不同录音里分数不可横向比较。
-4. 手机内存：图片模型约 212 MB 权重常驻，声学模型 30–50 MB。两个都懒加载，卸载时释放。
+4. 手机内存：图片模型约 212 MB 权重常驻，前置门控 11 MB，声学模型 30–50 MB。四个都懒加载，卸载时释放。
 5. Geomodel 需要经纬度；不配就只用声学结果。
-6. 许可证：BirdTrace **CC-BY-NC-4.0 禁商用**；BirdNET+ 按其 TERMS_OF_USE。
+6. 许可证：BirdTrace **CC-BY-NC-4.0 禁商用**；BirdNET+ 按其 TERMS_OF_USE；YOLO26-seg 权重为 **AGPL-3.0**。
 
 ---
 
@@ -298,3 +365,5 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 - 自定义物种白名单：把 `geo.allowedSpecies` 换成静态集合即可复用同一套过滤。
 - 结果落盘：handler 里加 `fs.writeFile` 写 CSV，配合 dsh-im 的文件回传能力发回合。
 - 量化：BirdTrace 官方无 fp16/int8 变体，若要省内存可自行做 QDQ 动态量化，但需要验证 Top-1 掉点。
+- 用分割遮罩抠图：`output1` 的 32 个系数已经解码并单测（`buildMask`），接上就能做到「只留鸟、背景涂黑再送分类器」，对杂乱背景应比矩形框更干净。
+- 门控阈值自适应：现在 `gateConfidence` 是全局常数；可以按首轮最高分决定要不要再看一眼（例如最高类别分数 0.3 且不是鸟时，值得 960 重跑而不必等到「一个都没有」）。
