@@ -336,7 +336,7 @@ Magisk 的 `su` 可以用；`adb root` 和 `run-as` 在 production build 上都�
 | 带附件不走模型 | `/birds` + 附件在 DSH Go 里发送 | 只出现一条命令结果，**没有 user 气泡进模型、没有新的 assistant 回复** |
 | token 计量 | 观察会话的 usage | **该回合没有模型请求** |
 | 多消息批次不误吞 | 排队一条普通 prompt 后紧接 `/birds` | 两条都被正常处理，普通 prompt 照常进模型 |
-| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 219 + 95 + 23 + 67 = 404 条断言全 PASS |
+| 单元自测 | `node test/selftest.mjs`、`node test/host-mock.mjs`、`node test/imports.mjs`、`node test/settings.mjs` | 219 + 100 + 23 + 67 = 409 条断言全 PASS |
 | 引用图片回查 | selftest 用临时 `group-history.sqlite` + `group-files/` 造同名附件，驱动 `resolveQuotedMedia()` | 命中 → 拿到实体文件并嗅探为 image；未收到过的图 → `unresolved`；纯文本引用 → 空 |
 | 引用语音回查 | 同上，但附件行是 `audio/amr`、引用条目只有 `{kind:'audio'}`（无 name），靠 `messageId` 查 | 仍能从历史库取回实体文件并嗅探为 audio；机器人没收到过的那条 → `unresolved`；无名的普通 file 不去瞎猜 |
 | dsh-im 补丁 | selftest 用两处锚点的小样本跑 `patchDshImSource()`，再以桩 `Bs`/`N5e`/`D5e` 执行生成的 `__qbQuotedMedia` | 改写生效且幂等；认不出抛 `UnsupportedBundleError`；下载器被改名后补丁跟着改名、找不到下载器时拒绝打补丁；引用图变成 image 并走平台白名单，引用语音变成 file 并走文件通道，无 filename 的录音补出可用后缀且编号不撞，重复/无 url/非白名单域名不搬 |

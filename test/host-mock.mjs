@@ -346,6 +346,62 @@ check('a bridge answer is not handed to a different turn', imWrongTurn.fellThrou
 const imRightTurn = await driveModelCall({ sessionId: imSession2, messages: [{ id: 'm-im', role: 'user', content: [] }] });
 check('the parked answer survives until its own turn asks for it', imRightTurn.fellThrough === false);
 
+// The shape that actually arrives from QQ: dsh-im prepends its envelope, its
+// heading and the guidance to the user's line in ONE text part — the line is
+// not a part of its own and not the first line of anything. Reading the part
+// from the start only made the command invisible, so the turn went to a model
+// that read the photo and answered "喵~ 这不是鸟，是一只橘猫".
+function imInlineMessage(body, extraParts = []) {
+  return {
+    id: 'm-im-inline',
+    role: 'user',
+    source: { kind: 'user' },
+    content: [
+      {
+        type: 'text',
+        text: '<dsh_im_source>{"channel":"qq","conversationType":"direct","senderId":"4A18"}</dsh_im_source>'
+          + '\n\n<dsh_im_source_guidance>\n仅依据当前消息的 <dsh_im_source> 中实际提供的字段理解来源；没有提供的字段不要猜测或补全。\n'
+          + '当前消息来自私聊，可以使用更轻松、幽默、详细的表达方式。\n</dsh_im_source_guidance>\n\n'
+          + body,
+      },
+      ...extraParts,
+    ],
+  };
+}
+
+const inlineSession = 'session-im-inline';
+const inlineLine = imInlineMessage('/birds ' + fakeImage + '\n这张是别人发我的');
+const inlineTaken = await runPreStep({ sessionId: inlineSession, messages: [inlineLine] });
+check(
+  'a QQ line sharing its text part with the envelope is claimed',
+  inlineTaken.fellThrough === true && inlineTaken.appended.length === 0,
+  JSON.stringify(inlineTaken.decision).slice(0, 160),
+);
+const inlineCall = await driveModelCall({ sessionId: inlineSession, messages: [inlineLine] });
+const inlineText = inlineCall.chunks[0]?.text ?? '';
+check('the inline QQ line is answered without calling a model', inlineCall.fellThrough === false && inlineText.length > 0, inlineText);
+check(
+  'the inline QQ line is read as a file argument, not as the whole prompt',
+  inlineText.includes('模型') && !inlineText.includes('用法：'),
+  inlineText,
+);
+
+const inlinePhotoSession = 'session-im-inline-photo';
+const inlinePhotoLine = imInlineMessage('/birds', [{ type: 'image', attachment: { id: 'a9' } }]);
+const inlinePhotoTaken = await runPreStep({ sessionId: inlinePhotoSession, messages: [inlinePhotoLine] });
+check(
+  'an inline QQ line that carries a photo is claimed too',
+  inlinePhotoTaken.fellThrough === true && inlinePhotoTaken.appended.length === 0,
+  JSON.stringify(inlinePhotoTaken.decision).slice(0, 160),
+);
+const inlinePhotoCall = await driveModelCall({ sessionId: inlinePhotoSession, messages: [inlinePhotoLine] });
+const inlinePhotoText = inlinePhotoCall.chunks[0]?.text ?? '';
+check(
+  'an inline QQ photo is recognised instead of being handed to a model',
+  inlinePhotoCall.fellThrough === false && inlinePhotoText.includes('模型'),
+  inlinePhotoText,
+);
+
 
 // A recording never arrives as a part: dsh-im downloads it, stages it inside
 // the session workspace and announces it in <dsh_im_files>. Before this was

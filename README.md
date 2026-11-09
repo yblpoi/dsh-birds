@@ -510,7 +510,7 @@ node test/imports.mjs     # 动态导入每个模块，防止坏导出或坏路�
 node test/settings.mjs    # 设置卡：三条路由的守卫 / 打补丁 / 还原 + 浏览器半体的槽位与文案
 ```
 
-在 Node.js v22+ 上 `selftest` 219 项 + `hosttest` 95 项 + `imports` 23 项 + `settings` 67 项，共 404 项断言全部 PASS。
+在 Node.js v22+ 上 `selftest` 219 项 + `hosttest` 100 项 + `imports` 23 项 + `settings` 67 项，共 409 项断言全部 PASS。
 
 `hosttest` 尤其重要，它证明两件事：handler 返回的永远是合法的 `CommandResult`（`kind: 'success' | 'error'` + `text`），模型缺文件、附件解析失败、sharp 缺失都不会让命令抛异常；以及 `agent/pre-step` 只接管「整批恰好一条 `/birds`」的情形 —— 裸 `/birds`、带图片的 `/birds` 会被接管，普通 prompt、`/birdstatus`、`/birdsomething`、同批带排队消息、回合中途的行都原样放行。
 
