@@ -410,6 +410,11 @@ cd ~/.dsh/profiles/web && npm install github:yblpoi/dsh-birds
 4. **`ffmpeg` 没就绪 + 非 WAV 音频**：插件自带的那份还在下载（`/birdstatus` 会显示进度）。下载失败时可以先发 WAV，或自己装一个系统 ffmpeg 顶一下（`config.ffmpegPath` / `$DSH_BIRDS_FFMPEG` 也能指定现成的二进制）。
 5. **模型下完但 `/birds` 仍说没模型**：模型目录是按运行插件的那个用户的 `$HOME` 解析的。用 root 手动跑过下载脚本，模型就落在 `/root/.dsh/models/bird`；如果 DSH 以别的用户运行，需要 `chown` 或显式传 `DSH_BIRDS_MODELS`/`--dir`。
 6. **在 proot 里手动跑命令**：从 Android 侧直接执行 `libproot.so` 会因为找不到 `libtalloc.so` 和临时目录而失败，必须先导出 `LD_LIBRARY_PATH`、`PROOT_LOADER`、`PROOT_L2S_DIR`、`PROOT_TMP_DIR`（这些值可以在 `/proc/<proot pid>/environ` 里看到）。用 Magisk 的 `su` 可以这样进：`su -c '<rootfs 里的 bash> -lc "cd /root && node ..."'`。
+7. **改了插件文件却「完全没生效」（`/birds` 变成普通文本、模型说这个命令什么也没接）**：多半是文件属主不对。用 `su -c cp` 往 rootfs 里写文件会产生 `root:root 600`，而引擎进程以 app uid（如 `u0_a356`）运行，读不进去 → 插件**整块 import 失败**，命令就不会注册。这种失败不会弹到聊天里，只在 `~/.dsh/dsh-app/diagnostics.md` 的引擎日志里留一行 `dsh-birds (dsh-birds): failed to import: Error: EACCES: permission denied`。修复：
+   ```bash
+   su -c 'chown u0_a356:u0_a356 <profile>/node_modules/dsh-birds/lib/index.js'
+   ```
+   改完必须**重启 DSH**（`su -c 'kill <pid>' < /dev/null`，不带这个 stdin 重定向会挂住），再用 `grep birds ~/.dsh/dsh-app/diagnostics.md` 确认重启后不再有新的 failed-to-import 行。核对归属：`find ~/.dsh/profiles/web -user root` 应该没有输出。
 
 ---
 
