@@ -144,7 +144,9 @@ const initial = await call(statusRoute, {});
 check('status answers 200', initial.status === 200, String(initial.status));
 const initialBody = initial.json();
 check('status finds one dsh-im', initialBody?.found === 1, JSON.stringify(initialBody?.bundles));
-check('status reports plugin version 1.0.0', initialBody?.pluginVersion === '1.0.0', initialBody?.pluginVersion);
+// 版本号跟着 package.json 走，别在这里写死：写死会让每次发版都多一处要改的地方。
+const packagedVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+check('status reports the plugin version from package.json', initialBody?.pluginVersion === packagedVersion, initialBody?.pluginVersion);
 check('status reports the dsh-im version', initialBody?.bundles?.[0]?.version === '5.8.0', JSON.stringify(initialBody?.bundles?.[0]));
 check('status starts unpatched', initialBody?.patched === false && initialBody?.bundles?.[0]?.patched === false);
 check('status starts with no backup', Array.isArray(initialBody?.bundles?.[0]?.backups) && initialBody.bundles[0].backups.length === 0);

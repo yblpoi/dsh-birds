@@ -207,6 +207,27 @@ const statusText = formatStatus({
 });
 check('status marks present/missing', statusText.includes('✓ imageModel') && statusText.includes('✗ audioModel'), statusText);
 
+// 版本号来自 package.json：升版本之后 /birdstatus 的第一行要跟着变，不能停在旧号上。
+const statusVersioned = formatStatus({
+  modelsDir: '/models',
+  status: {},
+  platform: 'linux',
+  arch: 'arm64',
+  node: 'v22.19.0',
+  available: true,
+  version: '9.9.9',
+});
+check('status names the plugin version', statusVersioned.startsWith('鸟类识别插件状态（dsh-birds 9.9.9）'), statusVersioned);
+const statusUnversioned = formatStatus({
+  modelsDir: '/models',
+  status: {},
+  platform: 'linux',
+  arch: 'arm64',
+  node: 'v22.19.0',
+  available: true,
+});
+check('status without a version keeps the plain heading', statusUnversioned.startsWith('鸟类识别插件状态\n'), statusUnversioned);
+
 const statusBilingual = formatStatus({
   modelsDir: '/models',
   status: {},
